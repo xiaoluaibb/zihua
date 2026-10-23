@@ -4,23 +4,23 @@
 
 ## 一键运行
 
-在 VPS 上以 root 执行：
+登录 VPS 后以 root 用户直接执行（无需 sudo）：
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/xiaoluaibb/zihua/main/zihua.sh)
+wget -P /root -N --no-check-certificate "https://raw.githubusercontent.com/xiaoluaibb/zihua/main/zihua.sh" && chmod 700 /root/zihua.sh && /root/zihua.sh
 ```
 
-若服务器没有 curl，可用 wget：
+没有 wget 时可用 curl：
 
 ```bash
-sudo bash <(wget -qO- https://raw.githubusercontent.com/xiaoluaibb/zihua/main/zihua.sh)
+curl -kfsSL "https://raw.githubusercontent.com/xiaoluaibb/zihua/main/zihua.sh" -o /root/zihua.sh && chmod 700 /root/zihua.sh && /root/zihua.sh
 ```
 
 ## 手动下载运行
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/xiaoluaibb/zihua/main/zihua.sh -o zihua.sh
-sudo bash zihua.sh
+bash zihua.sh
 ```
 
 ## 功能简介
@@ -47,16 +47,19 @@ sudo bash zihua.sh
 
 ### 提示 `bash: /dev/fd/63: No such file or directory`
 
-这是服务器没能成功下载脚本导致的：`bash <(curl ...)` 依赖下载成功后产生的临时管道，下载一失败管道就消失。此时改用"先下载、后运行"：
+两个可能原因：
+
+1. `sudo bash <(curl ...)` 中 sudo 会丢弃外层 shell 的临时管道，导致 bash 找不到 `/dev/fd/63`。**root 用户直接运行即可，不要加 sudo**。
+2. 服务器没能成功下载脚本：下载一失败管道就消失。此时改用"先下载、后运行"：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/xiaoluaibb/zihua/main/zihua.sh -o zihua.sh && sudo bash zihua.sh
+wget -P /root -N --no-check-certificate "https://raw.githubusercontent.com/xiaoluaibb/zihua/main/zihua.sh" && chmod 700 /root/zihua.sh && /root/zihua.sh
 ```
 
 若 raw 域名连不上（大陆方向常见），可走 GitHub API 通道，通常更稳定：
 
 ```bash
-curl -fsSL -H "Accept: application/vnd.github.raw" https://api.github.com/repos/xiaoluaibb/zihua/contents/zihua.sh -o zihua.sh && sudo bash zihua.sh
+curl -fsSL -H "Accept: application/vnd.github.raw" https://api.github.com/repos/xiaoluaibb/zihua/contents/zihua.sh -o /root/zihua.sh && chmod 700 /root/zihua.sh && /root/zihua.sh
 ```
 
 仍不行时，在本地电脑下载脚本后用 scp 上传运行：
