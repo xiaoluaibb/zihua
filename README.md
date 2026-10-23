@@ -43,6 +43,29 @@ sudo bash zihua.sh
 | 组件 | 需要 systemd |
 | 权限 | root（sudo）运行 |
 
+## 常见问题
+
+### 提示 `bash: /dev/fd/63: No such file or directory`
+
+这是服务器没能成功下载脚本导致的：`bash <(curl ...)` 依赖下载成功后产生的临时管道，下载一失败管道就消失。此时改用"先下载、后运行"：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/xiaoluaibb/zihua/main/zihua.sh -o zihua.sh && sudo bash zihua.sh
+```
+
+若 raw 域名连不上（大陆方向常见），可走 GitHub API 通道，通常更稳定：
+
+```bash
+curl -fsSL -H "Accept: application/vnd.github.raw" https://api.github.com/repos/xiaoluaibb/zihua/contents/zihua.sh -o zihua.sh && sudo bash zihua.sh
+```
+
+仍不行时，在本地电脑下载脚本后用 scp 上传运行：
+
+```bash
+scp zihua.sh root@服务器IP:/root/
+ssh root@服务器IP "bash /root/zihua.sh"
+```
+
 ## 注意事项
 
 - 请提前在云服务商安全组 / 防火墙放行脚本中使用的端口
