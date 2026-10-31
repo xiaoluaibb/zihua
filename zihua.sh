@@ -4,14 +4,15 @@
 #-------------------------------------------------------------------------------
 #  适用系统 : Debian 10+ / Ubuntu 18.04+ / Rocky / Alma / CentOS 7+(部分) /
 #             Fedora / Alpine 3.15+ / Arch  (需 systemd)
-#  运行方式 : 以 root 运行   sudo bash proxybox.sh
+#  运行方式 : 以 root 运行   bash zihua.sh   (root 下直接运行即可, 无需 sudo)
 #  统一内核 : sing-box (SS2022 / Hysteria2 / TUIC / VLESS-Reality-Vision /
 #             VLESS-Reality-gRPC 共用一个内核，一个服务多入站，方便增删改)
-#  版本     : v1.0.0  (2026-10)
+#  多协议   : 各协议独立实例+独立证书, TCP/UDP 端口可复用, 可同时运行
+#  版本     : v1.1.0  (2026-10)
 #===============================================================================
 
 #--------------------------------- 全局变量 ------------------------------------
-PROXYBOX_VERSION="1.0.0"
+PROXYBOX_VERSION="1.1.0"
 SB_BIN="/usr/local/bin/sing-box"
 SB_DIR="/etc/sing-box"
 SB_ENV_DIR="$SB_DIR/instance.d"          # 每个协议一份参数(env)
@@ -61,7 +62,7 @@ ask_valid() {
         if [[ -n "$def" ]]; then
             read -rp "$(printf '%s%s %s[回车=默认: %s]%s: ' "$CYAN" "$prompt" "$GRAY" "$def" "$NC")" val
         else
-            read -rp "$(printf '%s%s %s[建议留空自动生成]%s: ' "$CYAN" "$prompt" "$GRAY" "$NC")" val
+            read -rp "$(printf '%s%s %s[必填, 请直接输入]%s: ' "$CYAN" "$prompt" "$GRAY" "$NC")" val
         fi
         val="${val:-$def}"
         ERRMSG=""
@@ -283,15 +284,21 @@ port_busy_info() {
     ss -H -lntup 2>/dev/null | grep "[:.]${p}[[:space:]]" | awk '{print $5, $6, $7}' | sort -u | sed 's/users:((.*//' | head -n 3
 }
 
-# 本机所有已监听端口列表
+# 本机端口占用检测: port_in_use <端口> [tcp|udp|any]
 port_in_use() {
-    local p="$1"
+    local p="$1" proto="${2:-any}" flags
+    case "$proto" in
+        tcp) flags="-lnt" ;;
+        udp) flags="-lnu" ;;
+        *)   flags="-lntu" ;;
+    esac
     if command -v ss >/dev/null 2>&1; then
-        ss -H -lntu 2>/dev/null | awk '{print $5}' | grep -qE "[:.]${p}\$"
+        ss -H $flags 2>/dev/null | awk '{print $5}' | grep -qE "[:.]${p}\$"
     elif command -v netstat >/dev/null 2>&1; then
-        netstat -lntu 2>/dev/null | grep -qE "[:.]${p}[[:space:]]"
+        netstat -ln${proto:0:1} 2>/dev/null | grep -qE "[:.]${p}[[:space:]]"
     else
         # 尝试 TCP 连接 localhost (UDP 无法探测)
+        [[ "$proto" == "udp" ]] && return 1
         if (exec 3<>"/dev/tcp/127.0.0.1/${p}") 2>/dev/null; then return 0; fi
         return 1
     fi
@@ -301,18 +308,20 @@ port_in_use() {
 ask_port() {
     local def="$1" proto="$2" p
     title "监听端口设置"
-    info "填写规则: 1~65535 的纯数字；建议使用高位端口(如 10000 以上)；443/80 等低位端口可能与现有 Web 服务冲突。"
+    info "填写规则: 1~65535 的纯数字（建议使用 10000 以上的高位端口，避开 22/80/443 等常用端口）。"
+    info "本协议走 ${proto^^} 传输。TCP 与 UDP 互不冲突：如 TCP 443 已被网站占用，UDP 443 仍可给本协议用。"
+    info "同一 TCP 或同一 UDP 端口只能被一个协议使用（如 Vision 和 gRPC 都想用 TCP 443 则只能二选一）。"
     info "当前本机已监听端口: $(ss -H -lntu 2>/dev/null | awk '{print $5}' | sed 's/.*[:.]//' | sort -un | tr '\n' ' ' | cut -c1-120)..."
     while :; do
         ask_valid "输入端口" "$def" v_port
         p="$RESULT"
-        if ! port_in_use "$p"; then
-            PORT="$p"; ok "端口 $p 可用"; return 0
+        if ! port_in_use "$p" "$proto"; then
+            PORT="$p"; ok "端口 $p 可用(${proto^^})"; return 0
         fi
-        warn "端口 $p 已被占用:"
+        warn "端口 $p 的 ${proto^^} 已被占用:"
         port_busy_info "$p" | sed 's/^/    /'
-        info "UDP 与 TCP 是不同通道：例如 TCP 443 被网站占用时，UDP 443 一般仍可给代理用。"
-        ask_choice "如何处理?" 1 1 "换一个端口(推荐)" 2 "仍使用该端口(仅 UDP 型协议且另一协议占 TCP 时可用)"
+        info "提示: 若上方显示的是 TCP 占用而本协议是 UDP（或相反），实际并不冲突，可放心保留。"
+        ask_choice "如何处理?" 1 1 "换一个端口(推荐)" 2 "仍使用该端口(另一传输层确实空闲时可用)"
         if [[ "$RESULT" == "1" ]]; then
             def=""; continue
         fi
@@ -340,8 +349,12 @@ check_proxy_conflicts() {
             seen["$sname"]=1; found=1
         fi
     done
-    # 进程级兜底检查
+    # 进程级兜底检查(排除本脚本管理的 sing-box 服务自身, 避免把自己当成冲突代理)
+    local own_pid
+    own_pid="$(systemctl show -p MainPID --value "$SERVICE_NAME" 2>/dev/null)"
+    [[ -z "$own_pid" || "$own_pid" == "0" ]] && own_pid=""
     for pn in $(pgrep -d' ' -f "${pat}" 2>/dev/null); do
+        [[ -n "$own_pid" && "$pn" == "$own_pid" ]] && continue
         pname=$(ps -o comm= -p "$pn" 2>/dev/null | head -n1)
         [[ -n "$pname" && -z "${seen[$pname]:-}" ]] || continue
         printf '%s  - %s %s(PID %s 运行中)%s\n' "$YELLOW" "$pname" "$GRAY" "$pn" "$NC"
@@ -512,7 +525,7 @@ load_env() {
     local k="$1"
     # 以下变量将被 env 文件覆盖/补充
     PORT=""; METHOD=""; PASSWORD=""; UUID=""; NAME=""; MASQ=""
-    CERT_MODE=""; CERT_FILE=""; KEY_FILE=""; DOMAIN=""
+    CERT_MODE=""; CERT_FILE=""; KEY_FILE=""; DOMAIN=""; CERT_CN=""
     SNI_HOST=""; SNI_PORT=""; RPC=""
     REALITY_PK=""; REALITY_PUB=""; SHORT_ID=""
     # shellcheck disable=SC1090
@@ -521,15 +534,73 @@ load_env() {
 
 #--------------------------------- 自签证书 -------------------------------------
 gen_self_signed_cert() {
-    # $1 = CN(域名或 localhost)；产出 $SB_CERT_DIR/self.pem / self.key
-    local cn="$(echo "$1" | grep -oE '^[a-zA-Z0-9.-]+' || true)"
+    # $1 = 协议key, $2 = CN(伪装域名或 localhost)；产出 $SB_CERT_DIR/$1.pem / $1.key
+    # 每个协议独立证书, 多协议可各自使用不同伪装域名互不干扰
+    local k="$1"
+    local cn="$(echo "$2" | grep -oE '^[a-zA-Z0-9.-]+' || true)"
     mkdir -p "$SB_CERT_DIR"
-    if [[ ! -f "$SB_CERT_DIR/self.pem" || ! -f "$SB_CERT_DIR/self.key" ]]; then
+    if [[ -f "$SB_CERT_DIR/$k.pem" && -f "$SB_CERT_DIR/$k.key" ]]; then
+        echo "$SB_CERT_DIR/$k.pem"; return 0
+    fi
+    # 优先带 SAN(新 openssl), 失败则退回普通模式(老 openssl)
+    if ! openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
+            -keyout "$SB_CERT_DIR/$k.key" -out "$SB_CERT_DIR/$k.pem" \
+            -addext "subjectAltName=DNS:${cn:-localhost}" \
+            -subj "/CN=${cn:-localhost}" >/dev/null 2>&1; then
         openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
-            -keyout "$SB_CERT_DIR/self.key" -out "$SB_CERT_DIR/self.pem" \
+            -keyout "$SB_CERT_DIR/$k.key" -out "$SB_CERT_DIR/$k.pem" \
             -subj "/CN=${cn:-localhost}" >/dev/null 2>&1 || return 1
     fi
-    echo "$SB_CERT_DIR/self.pem"
+    chmod 600 "$SB_CERT_DIR/$k.key"
+    echo "$SB_CERT_DIR/$k.pem"
+}
+
+#--------------------------------- ACME 证书自动签发 (acme.sh) --------------------
+# $1 = 协议key, $2 = 域名; 成功后产出 $SB_CERT_DIR/$1.pem / $1.key (acme.sh 自动续期)
+acme_issue_cert() {
+    local k="$1" domain="$2"
+    local acme="$HOME/.acme.sh/acme.sh"
+    local ipres="${PUB_IP//[\[\]]/}" resolved log
+    if port_in_use 80 tcp; then
+        err "80 端口已被占用(HTTP 验证需要临时监听 80 端口)，请先释放后重试:"
+        port_busy_info 80 | sed 's/^/    /'
+        return 1
+    fi
+    # 域名解析检查(尽力而为, 仅提示不强制)
+    resolved=""
+    command -v getent >/dev/null 2>&1 && resolved="$(getent ahostsv4 "$domain" 2>/dev/null | awk 'NR==1{print $1}')"
+    [[ -z "$resolved" ]] && resolved="$(ping -c1 -W2 "$domain" 2>/dev/null | head -n1 | grep -oE '\([0-9.]+\)' | tr -d '()')"
+    if [[ -n "$resolved" && -n "$ipres" && "$resolved" != "$ipres" ]]; then
+        warn "域名 $domain 当前解析到 $resolved，与本机公网 IP $ipres 不一致，签发大概率失败。"
+        warn "常见原因: 域名套了 CDN 代理(如 Cloudflare 小黄云)、A 记录还没改。"
+        ask_choice "如何处理?" 2 1 "仍然继续尝试" 2 "取消, 改用自签证书"
+        [[ "$RESULT" == "1" ]] || return 1
+    fi
+    if [[ ! -x "$acme" ]]; then
+        info "安装 acme.sh ..."
+        curl -fsSL --connect-timeout 8 --max-time 120 https://get.acme.sh | sh -s email=proxybox@localhost >/dev/null 2>&1
+        if [[ ! -x "$acme" ]]; then
+            err "acme.sh 安装失败(可能网络受限)。可改用『已有证书文件』方式。"
+            return 1
+        fi
+    fi
+    info "向 Let's Encrypt 申请证书(域名: $domain, HTTP 验证)..."
+    if ! log="$("$acme" --issue --standalone -d "$domain" --server letsencrypt --keylength ec-256 2>&1)"; then
+        printf '%s\n' "$log" | tail -n 8 | sed 's/^/    /'
+        err "证书签发失败。常见原因: 域名未解析到本机 / 80 端口被运营商封禁 / 域名仍在 CDN 代理状态。"
+        return 1
+    fi
+    mkdir -p "$SB_CERT_DIR"
+    if ! "$acme" --install-cert -d "$domain" --ecc \
+            --fullchain-file "$SB_CERT_DIR/$k.pem" \
+            --key-file "$SB_CERT_DIR/$k.key" \
+            --reloadcmd "systemctl restart $SERVICE_NAME 2>/dev/null" >/dev/null 2>&1; then
+        err "证书安装失败。"
+        return 1
+    fi
+    chmod 600 "$SB_CERT_DIR/$k.key"
+    ok "证书已签发并安装: $SB_CERT_DIR/$k.pem (acme.sh 会自动续期并重启服务)"
+    return 0
 }
 
 #--------------------------------- 配置生成 -------------------------------------
@@ -541,6 +612,14 @@ gen_config() {
     local errf
     errf="$(mktemp)"
     load_env "$k"
+    CUR_KEY="$k"
+    # TLS 型协议使用自签模式但还没有本协议独立证书时, 先补生成(兼容旧版共享证书的安装)
+    case "$k" in
+        hy2|tuic)
+            if [[ "$CERT_MODE" != "manual" && ( ! -f "$SB_CERT_DIR/$k.pem" || ! -f "$SB_CERT_DIR/$k.key" ) ]]; then
+                gen_self_signed_cert "$k" "${DOMAIN:-localhost}" >/dev/null || true
+            fi ;;
+    esac
     [[ -f "$cfg" ]] && cp -f "$cfg" "$bak"
     case "$k" in
         ss2022)   cfg_body_ss2022   > "$cfg" ;;
@@ -591,12 +670,12 @@ cfg_body_ss2022() {
 EOF
 }
 
-# hy2 / tuic 共用的 TLS 字段拼装(自签或指定证书)
+# hy2 / tuic 共用的 TLS 字段拼装(自签或指定证书, 各协议独立证书文件)
 tls_fields() {
     if [[ "$CERT_MODE" == "manual" ]]; then
         echo "\"certificate_path\": \"${CERT_FILE}\", \"key_path\": \"${KEY_FILE}\""
     else
-        echo "\"certificate_path\": \"${SB_CERT_DIR}/self.pem\", \"key_path\": \"${SB_CERT_DIR}/self.key\""
+        echo "\"certificate_path\": \"${SB_CERT_DIR}/${CUR_KEY}.pem\", \"key_path\": \"${SB_CERT_DIR}/${CUR_KEY}.key\""
     fi
 }
 
@@ -770,11 +849,13 @@ print_share() {
             printf '  密码: %s\n' "$PASSWORD" ;;
         hy2)
             printf '  密码: %s\n' "$PASSWORD"
-            printf '  证书: %s\n' "$([[ "$CERT_MODE" == "manual" ]] && echo "自有证书(已校验)" || echo "自签(客户端需开启『允许不安全』)")" ;;
+            printf '  SNI/伪装域名: %s\n' "$DOMAIN"
+            printf '  证书: %s\n' "$([[ "$CERT_MODE" == "manual" ]] && echo "自有/签发证书(已校验, 无需开不安全)" || echo "自签(客户端需开启『允许不安全』)")" ;;
         tuic)
             printf '  UUID: %s\n' "$UUID"
             printf '  密码: %s\n' "$PASSWORD"
-            printf '  证书: %s\n' "$([[ "$CERT_MODE" == "manual" ]] && echo "自有证书(已校验)" || echo "自签(客户端需开启『允许不安全』)")" ;;
+            printf '  SNI/伪装域名: %s\n' "$DOMAIN"
+            printf '  证书: %s\n' "$([[ "$CERT_MODE" == "manual" ]] && echo "自有/签发证书(已校验, 无需开不安全)" || echo "自签(客户端需开启『允许不安全』)")" ;;
         vless-rv|vless-rg)
             printf '  UUID: %s\n' "$UUID"
             printf '  伪装站点(SNI): %s:%s\n' "$SNI_HOST" "${SNI_PORT:-443}"
@@ -805,29 +886,61 @@ ask_node_name() {
     NODE_NAME="$RESULT"
 }
 
-# reality 相关公共询问: 设置 SNIHOST/SNIPORT/REALITY_PK/REALITY_PUB/SHORT_ID
+# 测试目标站点是否支持 TLS1.3 (Reality 必需): 0=支持 1=不支持 2=无法测试
+test_tls13() {
+    local host="$1" port="${2:-443}" out
+    command -v openssl >/dev/null 2>&1 || return 2
+    command -v timeout >/dev/null 2>&1 || return 2
+    out="$(echo | timeout 8 openssl s_client -connect "${host}:${port}" -servername "$host" -tls1_3 2>/dev/null)"
+    [[ "$out" == *"TLSv1.3"* ]] || return 1
+    return 0
+}
+
+# reality 相关公共询问: 设置 SNI_HOST/SNI_PORT/REALITY_PK/REALITY_PUB/SHORT_ID
 ask_reality_params() {
-    title "Reality 伪装目标设置"
-    info "Reality 会伪装成访问真实大型网站的 HTTPS 流量，无需域名和证书。"
-    info "目标站点要位于墙外、支持 TLS1.3/H2，实际访问不跳转(301/302)到别处。小白直接回车即可。"
-    ask_choice "选择伪装目标站点" 1 \
-        1 "www.apple.com (推荐, 大厂 CDN, 稳定)" \
-        2 "www.microsoft.com" \
-        3 "www.bing.com" \
-        4 "www.spotify.com" \
-        5 "自定义输入域名"
-    case "$RESULT" in
-        1) SNI_HOST="www.apple.com" ;;
-        2) SNI_HOST="www.microsoft.com" ;;
-        3) SNI_HOST="www.bing.com" ;;
-        4) SNI_HOST="www.spotify.com" ;;
-        5) ask_valid "输入自定义目标域名(如 www.nvidia.com)" "www.nvidia.com" v_domain; SNI_HOST="$RESULT" ;;
-    esac
+    title "Reality 偷域名(伪装目标)设置"
+    info "原理: 把你的代理流量伪装成对某个真实大站的 HTTPS 访问，即『偷』别人的域名当门面，"
+    info "      因此不需要自己的域名、也不需要购买或申请任何证书。"
+    info "目标要求: ①境外可直连 ②支持 TLS1.3 与 H2 ③访问不发生 301/302 跳转 ④最好是大厂自有域名(而非公共 CDN)。"
+    info "不确定就直接回车用默认，选择后脚本会自动测试目标是否合格。"
     while :; do
-        ask_valid "目标站点端口" "443" v_port
-        SNI_PORT="$RESULT"
-        (( 10#$SNI_PORT == 80 )) && { err "目标端口必须是 TLS(HTTPS) 端口, 80 端口是 HTTP 不支持"; continue; }
-        break
+        ask_choice "选择要偷的域名(伪装目标)" 1 \
+            1 "www.apple.com（推荐: 苹果自有站, 全球节点多, TLS1.3 稳定）" \
+            2 "www.microsoft.com（微软官方站, TLS1.3）" \
+            3 "www.bing.com（微软搜索引擎, TLS1.3）" \
+            4 "www.spotify.com（流媒体站, 部分地区直连质量好）" \
+            5 "偷自己的域名（需已解析到一台支持 TLS1.3 的服务器或 CDN; 注意不能解析到本机自身）" \
+            6 "自定义其他域名（如 www.nvidia.com / dl.google.com, 需满足上述目标要求）"
+        case "$RESULT" in
+            1) SNI_HOST="www.apple.com" ;;
+            2) SNI_HOST="www.microsoft.com" ;;
+            3) SNI_HOST="www.bing.com" ;;
+            4) SNI_HOST="www.spotify.com" ;;
+            5) ask_valid "输入你自己的域名" "" v_domain; SNI_HOST="$RESULT" ;;
+            6) ask_valid "输入自定义目标域名" "www.nvidia.com" v_domain; SNI_HOST="$RESULT" ;;
+        esac
+        while :; do
+            ask_valid "目标站点端口(一般保持 443, 除非目标站用非标 TLS 端口)" "443" v_port
+            SNI_PORT="$RESULT"
+            (( 10#$SNI_PORT == 80 )) && { err "目标端口必须是 TLS(HTTPS) 端口, 80 端口是 HTTP 不支持"; continue; }
+            break
+        done
+        info "正在测试 $SNI_HOST:$SNI_PORT 的 TLS1.3 支持(约 3~8 秒)..."
+        test_tls13 "$SNI_HOST" "$SNI_PORT"
+        local trc=$?
+        if [[ "$trc" == "0" ]]; then
+            ok "目标站点合格, 支持 TLS1.3"
+            break
+        elif [[ "$trc" == "2" ]]; then
+            warn "本机缺少 openssl/timeout, 无法自动测试, 请自行确认目标支持 TLS1.3。"
+            break
+        else
+            warn "$SNI_HOST:$SNI_PORT 未通过 TLS1.3 测试(网络不通 / 不支持 / 或解析到了本机自身)。"
+            ask_choice "如何处理?" 1 \
+                1 "换一个伪装目标(推荐)" \
+                2 "仍然使用(Reality 握手可能失败, 无法工作)"
+            [[ "$RESULT" == "1" ]] || break
+        fi
     done
     info "生成 Reality 密钥对..."
     local kp
@@ -836,7 +949,7 @@ ask_reality_params() {
     REALITY_PUB="$(echo "$kp" | awk '/PublicKey/{print $2}')"
     [[ -z "$REALITY_PK" ]] && die "生成 Reality 密钥失败，请重试。"
     SHORT_ID="$(gen_hex 4)"
-    ok "Reality 参数就绪 (短ID: $SHORT_ID)"
+    ok "Reality 参数就绪 (偷域名: $SNI_HOST:$SNI_PORT, 短ID: $SHORT_ID)"
 }
 
 #--------------------------------- SS2022 ----------------------------------------
@@ -885,34 +998,55 @@ ENV
 
 #--------------------------------- Hysteria2 --------------------------------------
 add_hy2() {
-    pre_install "安装 Hysteria2" "Hysteria2 是基于 QUIC(UDP) 的高性能代理，弱网/高丢包环境速度优势明显。需要 TLS 证书；没有域名也能用『自签证书+客户端允许不安全』跑起来。" || return 1
+    pre_install "安装 Hysteria2" "Hysteria2 是基于 QUIC(UDP) 的高性能代理，弱网/高丢包环境速度优势明显。UDP 协议，端口号可与 TCP 型协议(如 VLESS-Vision 的 TCP 443)相同并存。" || return 1
     ask_port 8443 udp
     title "Hysteria2 密码设置"
     local defpass
     defpass="$(gen_rand 16)"
-    info "填写规则: 仅字母/数字/下划线/点/短横线，8~32 位。回车直接用随机密码。"
+    info "填写规则: 仅字母/数字/下划线/点/短横线（会拼进分享链接，别用特殊符号），8~32 位。回车直接用随机密码。"
     ask_valid "输入连接密码" "$defpass" v_uri_safe
     PASSWORD="$RESULT"
-    title "自签证书域名(可选)"
-    info "没有域名就回车。此域名仅作为伪装, 不需要真实存在。"
-    ask_valid "输入伪装域名" "bing.com" v_domain
-    DOMAIN="$RESULT"
-    ask_choice "TLS 证书来源" 1 \
-        1 "自动生成自签证书(最简单, 客户端需允许不安全)" \
-        2 "使用已有证书文件(输入证书和私钥路径)"
-    CERT_MODE="auto"
+    title "TLS 证书设置"
+    info "Hysteria2 走加密的 QUIC，必须有 TLS 证书。三种来源:"
+    info "① 自签证书: 不需要域名，脚本自动生成；代价是客户端节点里要打开『允许不安全/Insecure』开关。"
+    info "② 已有证书文件: 你已经用 acme.sh / certbot / 宝塔 等给域名签发过证书，直接填 pem 和 key 路径。"
+    info "③ acme.sh 自动申请: 需要你自己的域名已把 A 记录解析到本机 IP，且 80 端口空闲；签发全自动、自动续期，客户端无需开不安全。"
+    ask_choice "选择证书来源" 1 \
+        1 "自签证书（没有域名选这个，最快最简单）" \
+        2 "已有证书文件（我有签发好的 pem + key）" \
+        3 "acme.sh 自动申请（我有域名且已解析到本机）"
+    local fallback_selfsign=0
     CERT_FILE=""; KEY_FILE=""
     if [[ "$RESULT" == "2" ]]; then
-        ask_valid "输入证书(.pem/.crt)路径" "/etc/ssl/certs/ca.pem" v_path
+        ask_valid "输入证书(.pem/.crt)完整路径" "" v_path
         CERT_FILE="$RESULT"
-        ask_valid "输入私钥(.key)路径" "/etc/ssl/private/ca.key" v_path
+        ask_valid "输入私钥(.key)完整路径" "" v_path
         KEY_FILE="$RESULT"
         CERT_MODE="manual"
-    else
-        gen_self_signed_cert "$DOMAIN" >/dev/null || warn "自签证书生成失败，将回退到自动证书"
+        ask_valid "输入证书对应的域名(用于客户端 SNI)" "" v_domain
+        DOMAIN="$RESULT"
+    elif [[ "$RESULT" == "3" ]]; then
+        ask_valid "输入你的域名(需已解析到本机 IP)" "" v_domain
+        DOMAIN="$RESULT"
+        if acme_issue_cert "hy2" "$DOMAIN"; then
+            CERT_MODE="manual"; CERT_FILE="$SB_CERT_DIR/hy2.pem"; KEY_FILE="$SB_CERT_DIR/hy2.key"; CERT_CN="$DOMAIN"
+        else
+            warn "自动签发失败，改为自签证书。"
+            fallback_selfsign=1
+        fi
+    fi
+    if [[ "$CERT_MODE" != "manual" || "$fallback_selfsign" == "1" ]]; then
+        title "自签证书域名(伪装用)"
+        info "这个域名只是写进自签证书的名字（俗称『偷』一个域名填），不需要真实存在、不需要解析。"
+        info "客户端 SNI 也填它；客户端需打开『允许不安全/Insecure』开关。直接回车用默认即可。"
+        ask_valid "输入伪装域名" "bing.com" v_domain
+        DOMAIN="$RESULT"
+        [[ "$CERT_CN" != "$DOMAIN" ]] && rm -f "$SB_CERT_DIR/hy2.pem" "$SB_CERT_DIR/hy2.key"
+        gen_self_signed_cert hy2 "$DOMAIN" >/dev/null || warn "自签证书生成失败，将沿用旧证书"
+        CERT_MODE="auto"; CERT_FILE=""; KEY_FILE=""; CERT_CN="$DOMAIN"
     fi
     title "网站伪装(可选)"
-    info "没有认证的 HTTP 请求会被重定向到下面这个网站，让扫描行为更像正常站点。直接回车即可。"
+    info "没有认证的 HTTP 请求会被重定向到下面这个网站，让端口扫描行为更像正常站点。直接回车即可。"
     ask_valid "输入伪装网址" "https://www.bing.com" v_url
     MASQ="$RESULT"
     ask_node_name "hy2-${DOMAIN}"
@@ -924,6 +1058,7 @@ DOMAIN='$DOMAIN'
 CERT_MODE=$CERT_MODE
 CERT_FILE=$CERT_FILE
 KEY_FILE=$KEY_FILE
+CERT_CN='$CERT_CN'
 MASQ='$MASQ'
 NAME='$SAVE_NAME'
 CREATED=$(date '+%F %T')
@@ -936,33 +1071,56 @@ ENV
 
 #--------------------------------- TUIC -------------------------------------------
 add_tuic() {
-    pre_install "安装 TUIC v5" "TUIC 是基于 QUIC(UDP) 的代理，支持 0-RTT，延迟低。与 Hysteria2 类似，需要 TLS。" || return 1
+    pre_install "安装 TUIC v5" "TUIC 是基于 QUIC(UDP) 的代理，支持 0-RTT，延迟低。与 Hysteria2 同为 UDP 协议，端口可与 TCP 型协议共用同号。" || return 1
     ask_port 9443 udp
     title "TUIC 身份与密码"
     local dpass duuid
     duuid="$(gen_uuid)"
     dpass="$(gen_rand 16)"
-    info "UUID: 客户端身份标识。回车自动生成。"
+    info "UUID: 客户端身份标识（一串带横线的十六进制）。回车自动生成。"
     ask_valid "输入 UUID" "$duuid" v_uuid
     UUID="$RESULT"
-    info "密码: 用于 TUIC 认证。仅字母/数字/下划线等。回车使用随机。"
+    info "密码: 用于 TUIC 认证。仅字母/数字/下划线等（会拼进分享链接），回车使用随机。"
     ask_valid "输入密码" "$dpass" v_uri_safe
     PASSWORD="$RESULT"
-    ask_valid "输入伪装域名(用于自签证书/客户端 SNI)" "bing.com" v_domain
-    DOMAIN="$RESULT"
-    ask_choice "TLS 证书来源" 1 \
-        1 "自动生成自签证书(最简单, 客户端需允许不安全)" \
-        2 "使用已有证书文件"
-    CERT_MODE="auto"
+    title "TLS 证书设置"
+    info "TUIC 同样需要 TLS 证书。三种来源:"
+    info "① 自签证书: 不需要域名，脚本自动生成；客户端需打开『允许不安全/Insecure』开关。"
+    info "② 已有证书文件: 已给域名签发过证书，直接填 pem 和 key 路径。"
+    info "③ acme.sh 自动申请: 域名需已解析到本机 IP，80 端口空闲；全自动签发+续期。"
+    ask_choice "选择证书来源" 1 \
+        1 "自签证书（没有域名选这个，最快最简单）" \
+        2 "已有证书文件（我有签发好的 pem + key）" \
+        3 "acme.sh 自动申请（我有域名且已解析到本机）"
+    local fallback_selfsign=0
     CERT_FILE=""; KEY_FILE=""
     if [[ "$RESULT" == "2" ]]; then
-        ask_valid "输入证书路径" "/etc/ssl/certs/ca.pem" v_path
+        ask_valid "输入证书(.pem/.crt)完整路径" "" v_path
         CERT_FILE="$RESULT"
-        ask_valid "输入私钥路径" "/etc/ssl/private/ca.key" v_path
+        ask_valid "输入私钥(.key)完整路径" "" v_path
         KEY_FILE="$RESULT"
         CERT_MODE="manual"
-    else
-        gen_self_signed_cert "$DOMAIN" >/dev/null || warn "自签证书生成失败，将回退到自动证书"
+        ask_valid "输入证书对应的域名(用于客户端 SNI)" "" v_domain
+        DOMAIN="$RESULT"
+    elif [[ "$RESULT" == "3" ]]; then
+        ask_valid "输入你的域名(需已解析到本机 IP)" "" v_domain
+        DOMAIN="$RESULT"
+        if acme_issue_cert "tuic" "$DOMAIN"; then
+            CERT_MODE="manual"; CERT_FILE="$SB_CERT_DIR/tuic.pem"; KEY_FILE="$SB_CERT_DIR/tuic.key"; CERT_CN="$DOMAIN"
+        else
+            warn "自动签发失败，改为自签证书。"
+            fallback_selfsign=1
+        fi
+    fi
+    if [[ "$CERT_MODE" != "manual" || "$fallback_selfsign" == "1" ]]; then
+        title "自签证书域名(伪装用)"
+        info "这个域名只是写进自签证书的名字（俗称『偷』一个域名填），不需要真实存在、不需要解析。"
+        info "客户端 SNI 也填它；客户端需打开『允许不安全/Insecure』开关。直接回车用默认即可。"
+        ask_valid "输入伪装域名" "bing.com" v_domain
+        DOMAIN="$RESULT"
+        [[ "$CERT_CN" != "$DOMAIN" ]] && rm -f "$SB_CERT_DIR/tuic.pem" "$SB_CERT_DIR/tuic.key"
+        gen_self_signed_cert tuic "$DOMAIN" >/dev/null || warn "自签证书生成失败，将沿用旧证书"
+        CERT_MODE="auto"; CERT_FILE=""; KEY_FILE=""; CERT_CN="$DOMAIN"
     fi
     ask_node_name "tuic-${DOMAIN}"
     SAVE_NAME="$NODE_NAME"
@@ -974,6 +1132,7 @@ DOMAIN='$DOMAIN'
 CERT_MODE=$CERT_MODE
 CERT_FILE=$CERT_FILE
 KEY_FILE=$KEY_FILE
+CERT_CN='$CERT_CN'
 NAME='$SAVE_NAME'
 CREATED=$(date '+%F %T')
 ENV
@@ -990,7 +1149,7 @@ add_vless_rv() {
     ask_port 443 tcp
     ask_valid "输入 VLESS UUID" "$(gen_uuid)" v_uuid
     UUID="$RESULT"
-    ask_node_name "vless- Vision-${SNI_HOST}"
+    ask_node_name "vless-rv-${SNI_HOST}"
     SAVE_NAME="$NODE_NAME"
     cat > "$SB_ENV_DIR/vless-rv.env" <<ENV
 PORT=$PORT
@@ -1122,7 +1281,7 @@ menu_view() {
 # env 文件重写(修改后调用), 依赖 load_env 结果；单引号会被剔除以保护 env 语法
 rewrite_env() {
     local k="$1"
-    local base="PORT UUID PASSWORD METHOD NAME DOMAIN CERT_MODE CERT_FILE KEY_FILE MASQ SNI_HOST SNI_PORT RPC REALITY_PUB REALITY_PK SHORT_ID"
+    local base="PORT UUID PASSWORD METHOD NAME DOMAIN CERT_MODE CERT_FILE KEY_FILE CERT_CN MASQ SNI_HOST SNI_PORT RPC REALITY_PUB REALITY_PK SHORT_ID"
     local var val out=""
     {
         for var in $base; do
@@ -1169,8 +1328,14 @@ menu_edit_ss2022() {
                 2) METHOD="2022-blake3-aes-128-gcm"; PKG_LEN=16 ;;
                 3) METHOD="2022-blake3-chacha20-poly1305"; PKG_LEN=32 ;;
             esac
-            ask "输入新密码(Base64)" "$(gen_b64 "$PKG_LEN")"
-            PASSWORD="$RESULT" ;;
+            local d exp="$PKG_LEN"
+            while :; do
+                ask "输入新密码(Base64, 回车自动生成合规密码)" "$(gen_b64 "$PKG_LEN")"
+                PASSWORD="$RESULT"
+                d="$(printf '%s' "$PASSWORD" | openssl base64 -d -A 2>/dev/null | wc -c | tr -d ' ')"
+                [[ "$d" == "$exp" ]] && break
+                err "密码解码后为 $d 字节，需要 $exp 字节。"
+            done ;;
         3)
             ask "输入新名称" "${NAME:-$k}"
             NAME="$RESULT" ;;
@@ -1185,8 +1350,8 @@ menu_edit_hy2() {
     ask_choice "Hysteria2 修改项" "" \
         1 "修改监听端口(当前: $PORT)" \
         2 "修改连接密码(当前已设置)" \
-        3 "更换证书方式(自签/自有)" \
-        4 "修改伪装域名(当前: ${DOMAIN})" \
+        3 "更换证书方式(自签/已有文件/acme自动申请)" \
+        4 "修改伪装域名(当前: ${DOMAIN}; 自签模式下会同步重新生成证书)" \
         5 "修改节点名称(当前: ${NAME})"
     [[ -z "$RESULT" ]] && return 0
     case "$RESULT" in
@@ -1194,18 +1359,33 @@ menu_edit_hy2() {
         2) ask_valid "输入新密码" "$(gen_rand 16)" v_uri_safe; PASSWORD="$RESULT";;
         3)
             ask_choice "TLS 证书来源" 1 \
-                1 "自动生成自签证书(客户端需允许不安全)" \
-                2 "使用已有证书文件"
+                1 "自签证书(客户端需允许不安全)" \
+                2 "已有证书文件" \
+                3 "acme.sh 自动申请(需域名解析到本机, 80 端口空闲)"
             if [[ "$RESULT" == "2" ]]; then
-                ask_valid "输入证书路径" "${CERT_FILE:-/etc/ssl/certs/ca.pem}" v_path; CERT_FILE="$RESULT"
-                ask_valid "输入私钥路径" "${KEY_FILE:-/etc/ssl/private/ca.key}" v_path; KEY_FILE="$RESULT"
+                ask_valid "输入证书路径" "${CERT_FILE:-}" v_path; CERT_FILE="$RESULT"
+                ask_valid "输入私钥路径" "${KEY_FILE:-}" v_path; KEY_FILE="$RESULT"
                 CERT_MODE="manual"
+            elif [[ "$RESULT" == "3" ]]; then
+                ask_valid "输入你的域名" "${DOMAIN:-}" v_domain; DOMAIN="$RESULT"
+                if acme_issue_cert hy2 "$DOMAIN"; then
+                    CERT_MODE="manual"; CERT_FILE="$SB_CERT_DIR/hy2.pem"; KEY_FILE="$SB_CERT_DIR/hy2.key"; CERT_CN="$DOMAIN"
+                else
+                    warn "签发失败, 保持原证书方式不变。"
+                fi
             else
-                gen_self_signed_cert "$DOMAIN" >/dev/null
+                [[ "$CERT_CN" != "$DOMAIN" ]] && rm -f "$SB_CERT_DIR/hy2.pem" "$SB_CERT_DIR/hy2.key"
+                gen_self_signed_cert hy2 "$DOMAIN" >/dev/null && CERT_CN="$DOMAIN"
                 CERT_MODE="auto"; CERT_FILE=""; KEY_FILE=""
                 warn "已重新生成自签证书, 客户端需允许不安全"
             fi ;;
-        4) ask_valid "输入伪装域名" "$DOMAIN" v_domain; DOMAIN="$RESULT";;
+        4)
+            ask_valid "输入伪装域名(自签模式下会同步重新生成证书)" "$DOMAIN" v_domain; DOMAIN="$RESULT"
+            if [[ "$CERT_MODE" != "manual" && "$CERT_CN" != "$DOMAIN" ]]; then
+                rm -f "$SB_CERT_DIR/hy2.pem" "$SB_CERT_DIR/hy2.key"
+                gen_self_signed_cert hy2 "$DOMAIN" >/dev/null && CERT_CN="$DOMAIN"
+                ok "自签证书已按新域名重新生成"
+            fi;;
         5) ask "输入新名称" "${NAME:-$k}"; NAME="$RESULT";;
     esac
     rewrite_env "$k"
@@ -1219,8 +1399,9 @@ menu_edit_tuic() {
         1 "修改监听端口(当前: $PORT)" \
         2 "修改 UUID" \
         3 "修改密码" \
-        4 "更换证书方式(自签/自有)" \
-        5 "修改节点名称(当前: ${NAME})"
+        4 "更换证书方式(自签/已有文件/acme自动申请)" \
+        5 "修改伪装域名(当前: ${DOMAIN}; 自签模式下会同步重新生成证书)" \
+        6 "修改节点名称(当前: ${NAME})"
     [[ -z "$RESULT" ]] && return 0
     case "$RESULT" in
         1) ask_port "$PORT" udp ;;
@@ -1228,18 +1409,34 @@ menu_edit_tuic() {
         3) ask_valid "输入新密码" "$(gen_rand 16)" v_uri_safe; PASSWORD="$RESULT";;
         4)
             ask_choice "TLS 证书来源" 1 \
-                1 "自动生成自签证书(客户端需允许不安全)" \
-                2 "使用已有证书文件"
+                1 "自签证书(客户端需允许不安全)" \
+                2 "已有证书文件" \
+                3 "acme.sh 自动申请(需域名解析到本机, 80 端口空闲)"
             if [[ "$RESULT" == "2" ]]; then
-                ask_valid "输入证书路径" "${CERT_FILE:-/etc/ssl/certs/ca.pem}" v_path; CERT_FILE="$RESULT"
-                ask_valid "输入私钥路径" "${KEY_FILE:-/etc/ssl/private/ca.key}" v_path; KEY_FILE="$RESULT"
+                ask_valid "输入证书路径" "${CERT_FILE:-}" v_path; CERT_FILE="$RESULT"
+                ask_valid "输入私钥路径" "${KEY_FILE:-}" v_path; KEY_FILE="$RESULT"
                 CERT_MODE="manual"
+            elif [[ "$RESULT" == "3" ]]; then
+                ask_valid "输入你的域名" "${DOMAIN:-}" v_domain; DOMAIN="$RESULT"
+                if acme_issue_cert tuic "$DOMAIN"; then
+                    CERT_MODE="manual"; CERT_FILE="$SB_CERT_DIR/tuic.pem"; KEY_FILE="$SB_CERT_DIR/tuic.key"; CERT_CN="$DOMAIN"
+                else
+                    warn "签发失败, 保持原证书方式不变。"
+                fi
             else
-                gen_self_signed_cert "$DOMAIN" >/dev/null
+                [[ "$CERT_CN" != "$DOMAIN" ]] && rm -f "$SB_CERT_DIR/tuic.pem" "$SB_CERT_DIR/tuic.key"
+                gen_self_signed_cert tuic "$DOMAIN" >/dev/null && CERT_CN="$DOMAIN"
                 CERT_MODE="auto"; CERT_FILE=""; KEY_FILE=""
                 warn "已重新生成自签证书, 客户端需允许不安全"
             fi ;;
-        5) ask "输入新名称" "${NAME:-$k}"; NAME="$RESULT";;
+        5)
+            ask_valid "输入伪装域名(自签模式下会同步重新生成证书)" "$DOMAIN" v_domain; DOMAIN="$RESULT"
+            if [[ "$CERT_MODE" != "manual" && "$CERT_CN" != "$DOMAIN" ]]; then
+                rm -f "$SB_CERT_DIR/tuic.pem" "$SB_CERT_DIR/tuic.key"
+                gen_self_signed_cert tuic "$DOMAIN" >/dev/null && CERT_CN="$DOMAIN"
+                ok "自签证书已按新域名重新生成"
+            fi;;
+        6) ask "输入新名称" "${NAME:-$k}"; NAME="$RESULT";;
     esac
     rewrite_env "$k"
     apply_one "$k" && print_share "$k"
@@ -1252,13 +1449,13 @@ menu_edit_vless() {
         ask_choice "VLESS-Reality-Vision 修改项" "" \
             1 "修改监听端口(当前: $PORT)" \
             2 "修改 UUID" \
-            3 "重新选择伪装站点并重置 Reality 密钥" \
+            3 "重新选择偷域名(伪装站点)并重置 Reality 密钥" \
             4 "修改节点名称(当前: ${NAME})"
     else
         ask_choice "VLESS-Reality-gRPC 修改项" "" \
             1 "修改监听端口(当前: $PORT)" \
             2 "修改 UUID" \
-            3 "重新选择伪装站点并重置 Reality 密钥" \
+            3 "重新选择偷域名(伪装站点)并重置 Reality 密钥" \
             4 "修改 gRPC 服务名(当前: ${RPC})" \
             5 "修改节点名称(当前: ${NAME})"
     fi
@@ -1482,7 +1679,7 @@ net_restore() {
     sysctl -w net.core.default_qdisc=pfifo_fast >/dev/null 2>&1 || true
     echo "  拥塞控制: $(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)"
     echo "  队列: $(cat /proc/sys/net/core/default_qdisc 2>/dev/null)"
-    ok "迁移默认完成"
+    ok "已恢复默认参数"
 }
 
 menu_network() {
@@ -1524,7 +1721,7 @@ menu_install() {
         printf '  %s4)%s '   "$BOLD" "$NC"; mark_installed "vless-rg"; echo "VLESS-Reality-gRPC   TCP, 伪装+grpc传输"
         printf '  %s5)%s '   "$BOLD" "$NC"; mark_installed "tuic";     echo "TUIC v5              UDP/QUIC, 0-RTT 低延迟"
         echo "  ${BOLD}0)${NC} 返回上级"
-        info "提示: 相同端口只能被一个服务占用；TCP 与 UDP 可共存(如 Vision 用 TCP 443, Hysteria2 用 UDP 443)。"
+        info "提示: 多个协议可同时运行互不影响; 端口规则: 同为 TCP 或同为 UDP 不可重复, TCP 与 UDP 可同号(如 Vision 用 TCP 443, Hysteria2 用 UDP 443)。"
         ask "请选择" "0"
         local key=""
         case "$RESULT" in
@@ -1639,7 +1836,7 @@ main_menu() {
 
 #--------------------------------- 主入口 ------------------------------------------
 main() {
-    [[ $EUID -eq 0 ]] || die "请以 root 运行: sudo bash $0"
+    [[ $EUID -eq 0 ]] || die "请以 root 运行: bash $0 (root 用户直接运行即可, 无需 sudo)"
     detect_os
     mkdir -p "$SB_DIR" "$SB_ENV_DIR" "$SB_CFG_DIR" "$SB_CERT_DIR" "$SB_BAK_DIR"
     chmod 700 "$SB_DIR"
