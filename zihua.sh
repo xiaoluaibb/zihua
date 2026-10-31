@@ -10,11 +10,11 @@
 #             VLESS-Reality-gRPC 共用一个内核，一个服务多入站，方便增删改)
 #  多协议   : 各协议独立实例+独立证书, TCP/UDP 端口可复用, 可同时运行
 #  附加功能 : 一键重装系统 (调用同仓库 reinstall-vm.sh, 支持 KVM/LXC)
-#  版本     : v1.2.0  (2026-10)
+#  版本     : v1.2.1  (2026-10)
 #===============================================================================
 
 #--------------------------------- 全局变量 ------------------------------------
-PROXYBOX_VERSION="1.2.0"
+PROXYBOX_VERSION="1.2.1"
 SB_BIN="/usr/local/bin/sing-box"
 SB_DIR="/etc/sing-box"
 SB_ENV_DIR="$SB_DIR/instance.d"          # 每个协议一份参数(env)
@@ -452,13 +452,38 @@ install_core() {
     install -m 0755 "$tmp/$base/sing-box" "$SB_BIN"
     rm -rf "$tmp"
     chmod +x "$SB_BIN"
+    # 真正执行一次验证: 二进制存在不代表能跑(musl/glibc 动态链接问题在 Alpine 上常见)
+    if ! "$SB_BIN" version >/dev/null 2>&1; then
+        err "sing-box 已下载但无法运行(常见于 Alpine/musl 系统: 缺少 glibc 兼容层)。"
+        if command -v apk >/dev/null 2>&1; then
+            info "正在自动安装兼容层 gcompat ..."
+            apk add --no-cache gcompat libstdc++ >/dev/null 2>&1
+            if "$SB_BIN" version >/dev/null 2>&1; then
+                ok "兼容层安装成功, sing-box 可正常运行"
+            else
+                die "仍无法运行。请手动执行: apk add gcompat libstdc++ 后重试; 或改用 Debian/Ubuntu 系统。"
+            fi
+        else
+            die "无法运行 $SB_BIN，请检查系统兼容性(可先手动执行 '$SB_BIN version' 查看报错)。"
+        fi
+    fi
     ok "sing-box 安装完成: $("$SB_BIN" version 2>/dev/null | head -n1)"
 }
 
 ensure_core() {
     if [[ -x "$SB_BIN" ]]; then
-        info "检测到已安装内核: $($SB_BIN version 2>/dev/null | head -n1)"
-        return 0
+        # 不仅要存在, 还要真的能运行(防止上次残留一个跑不起来的二进制)
+        if "$SB_BIN" version >/dev/null 2>&1; then
+            info "检测到已安装内核: $($SB_BIN version 2>/dev/null | head -n1)"
+            return 0
+        fi
+        warn "检测到 $SB_BIN 存在但无法运行(可能是 musl 系统缺少 glibc 兼容层), 尝试修复..."
+        if command -v apk >/dev/null 2>&1; then
+            apk add --no-cache gcompat libstdc++ >/dev/null 2>&1 || true
+            "$SB_BIN" version >/dev/null 2>&1 && { info "修复成功: $($SB_BIN version 2>/dev/null | head -n1)"; return 0; }
+        fi
+        rm -f "$SB_BIN"
+        warn "修复失败, 已删除损坏内核, 重新安装..."
     fi
     info "未检测到 sing-box 内核，开始安装..."
     install_core
@@ -985,6 +1010,22 @@ test_tls13() {
     return 0
 }
 
+# openssl 兜底生成 Reality X25519 密钥对(一次生成一对): 成功后写入 OSSL_PRIV / OSSL_PUB (base64)
+ossl_reality_keypair() {
+    command -v openssl >/dev/null 2>&1 || return 1
+    local dir pem privhex pubhex
+    dir="$(mktemp -d)" || return 1
+    pem="$dir/x25519.pem"
+    openssl genpkey -algorithm X25519 -out "$pem" 2>/dev/null || { rm -rf "$dir"; return 1; }
+    privhex="$(openssl pkey -in "$pem" -text -noout 2>/dev/null | awk '/priv:/{f=1;next} /pub:/{f=0} f' | tr -d ' :\n')"
+    pubhex="$(openssl pkey -in "$pem" -pubout -text -noout 2>/dev/null | awk '/pub:/{f=1;next} f' | tr -d ' :\n')"
+    rm -rf "$dir"
+    [[ "$privhex" =~ ^[0-9a-fA-F]{64}$ && "$pubhex" =~ ^[0-9a-fA-F]{64}$ ]] || return 1
+    OSSL_PRIV="$(printf '%b' "$(echo "$privhex" | sed 's/../\\x&/g')" | openssl base64 -A 2>/dev/null)"
+    OSSL_PUB="$(printf '%b' "$(echo "$pubhex" | sed 's/../\\x&/g')" | openssl base64 -A 2>/dev/null)"
+    [[ ${#OSSL_PRIV} -ge 40 && ${#OSSL_PUB} -ge 40 ]]
+}
+
 # reality 相关公共询问: 设置 SNI_HOST/SNI_PORT/REALITY_PK/REALITY_PUB/SHORT_ID
 ask_reality_params() {
     title "Reality 偷域名(伪装目标)设置"
@@ -1033,10 +1074,24 @@ ask_reality_params() {
     done
     info "生成 Reality 密钥对..."
     local kp
-    kp="$("$SB_BIN" generate reality-keypair 2>/dev/null)"
+    kp="$("$SB_BIN" generate reality-keypair 2>&1)"
     REALITY_PK="$(echo "$kp" | awk '/PrivateKey/{print $2}')"
     REALITY_PUB="$(echo "$kp" | awk '/PublicKey/{print $2}')"
-    [[ -z "$REALITY_PK" ]] && die "生成 Reality 密钥失败，请重试。"
+    # 兜底: sing-box 无法执行时, 用 openssl 直接生成 X25519 密钥对 (Reality 兼容)
+    if [[ -z "$REALITY_PK" ]]; then
+        warn "sing-box 生成密钥失败, 内核输出: $(echo "$kp" | head -n1)"
+        warn "尝试 openssl 兜底方案..."
+        if ossl_reality_keypair; then
+            REALITY_PK="$OSSL_PRIV"
+            REALITY_PUB="$OSSL_PUB"
+            ok "openssl 兜底生成成功"
+        fi
+    fi
+    if [[ -z "$REALITY_PK" ]]; then
+        err "两种方式均无法生成密钥。请手动排查: 执行 '$SB_BIN version' 看内核是否能运行;"
+        err "Alpine 系统先执行: apk add gcompat libstdc++ openssl 后重跑本脚本。"
+        die "生成 Reality 密钥失败。"
+    fi
     SHORT_ID="$(gen_hex 4)"
     ok "Reality 参数就绪 (偷域名: $SNI_HOST:$SNI_PORT, 短ID: $SHORT_ID)"
 }
