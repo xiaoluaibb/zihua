@@ -14,7 +14,7 @@
 #===============================================================================
 
 #--------------------------------- 全局变量 ------------------------------------
-PROXYBOX_VERSION="1.2.1"
+PROXYBOX_VERSION="1.2.2"
 SB_BIN="/usr/local/bin/sing-box"
 SB_DIR="/etc/sing-box"
 SB_ENV_DIR="$SB_DIR/instance.d"          # 每个协议一份参数(env)
@@ -1132,7 +1132,7 @@ PORT=$PORT
 METHOD=$METHOD
 PASSWORD='$PASSWORD'
 NAME='$SAVE_NAME'
-CREATED=$(date '+%F %T')
+CREATED="$(date '+%F %T')"
 ENV
     chmod 600 "$SB_ENV_DIR/ss2022.env"
     apply_one "ss2022" || return 1
@@ -1205,7 +1205,7 @@ KEY_FILE=$KEY_FILE
 CERT_CN='$CERT_CN'
 MASQ='$MASQ'
 NAME='$SAVE_NAME'
-CREATED=$(date '+%F %T')
+CREATED="$(date '+%F %T')"
 ENV
     chmod 600 "$SB_ENV_DIR/hy2.env"
     apply_one "hy2" || return 1
@@ -1278,7 +1278,7 @@ CERT_FILE=$CERT_FILE
 KEY_FILE=$KEY_FILE
 CERT_CN='$CERT_CN'
 NAME='$SAVE_NAME'
-CREATED=$(date '+%F %T')
+CREATED="$(date '+%F %T')"
 ENV
     chmod 600 "$SB_ENV_DIR/tuic.env"
     apply_one "tuic" || return 1
@@ -1304,7 +1304,7 @@ REALITY_PK='$REALITY_PK'
 REALITY_PUB='$REALITY_PUB'
 SHORT_ID=$SHORT_ID
 NAME='$SAVE_NAME'
-CREATED=$(date '+%F %T')
+CREATED="$(date '+%F %T')"
 ENV
     chmod 600 "$SB_ENV_DIR/vless-rv.env"
     apply_one "vless-rv" || return 1
@@ -1333,7 +1333,7 @@ REALITY_PK='$REALITY_PK'
 REALITY_PUB='$REALITY_PUB'
 SHORT_ID=$SHORT_ID
 NAME='$SAVE_NAME'
-CREATED=$(date '+%F %T')
+CREATED="$(date '+%F %T')"
 ENV
     chmod 600 "$SB_ENV_DIR/vless-rg.env"
     apply_one "vless-rg" || return 1
@@ -1433,7 +1433,7 @@ rewrite_env() {
             val="${val//\'/}"
             [[ -n "$val" ]] && printf "%s='%s'\n" "$var" "$val"
         done
-        echo "CREATED=$(date '+%F %T')"
+        echo "CREATED="$(date '+%F %T')""
     } > "$SB_ENV_DIR/$k.env"
     chmod 600 "$SB_ENV_DIR/$k.env"
 }
