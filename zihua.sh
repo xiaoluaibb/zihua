@@ -14,7 +14,7 @@
 #===============================================================================
 
 #--------------------------------- 全局变量 ------------------------------------
-PROXYBOX_VERSION="1.2.2"
+PROXYBOX_VERSION="1.2.3"
 SB_BIN="/usr/local/bin/sing-box"
 SB_DIR="/etc/sing-box"
 SB_ENV_DIR="$SB_DIR/instance.d"          # 每个协议一份参数(env)
@@ -613,6 +613,7 @@ UNIT
 }
 
 svc_restart() {
+    cleanup_orphan_configs
     ensure_service
     if ! svc_do_restart; then
         err "服务重启失败，最近日志如下:"
@@ -1343,6 +1344,19 @@ ENV
 
 #--------------------------------- 安装后应用 -------------------------------------
 # 应用某个协议: 生成配置并重启服务 (参数已在 env 文件中)
+# 清理孤儿配置: configs 下有 json 但 instance.d 缺少对应 env 的残留文件(防止已删协议继续被 sing-box 加载)
+cleanup_orphan_configs() {
+    local f k
+    for f in "$SB_CFG_DIR"/*.json; do
+        [[ -e "$f" ]] || return 0
+        k="$(basename "$f" .json)"
+        if [[ ! -f "$SB_ENV_DIR/$k.env" ]]; then
+            rm -f "$f" "$SB_BAK_DIR/$k.json.bak"
+            warn "已清理残留配置: $k.json (对应协议参数文件不存在)"
+        fi
+    done
+}
+
 apply_one() {
     local k="$1"
     ensure_dirs
