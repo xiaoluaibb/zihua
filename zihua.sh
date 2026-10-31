@@ -3,16 +3,18 @@
 #  ProxyBox — 多协议代理一键安装/管理 + 网络优化(BBR/内核调优) 交互式脚本
 #-------------------------------------------------------------------------------
 #  适用系统 : Debian 10+ / Ubuntu 18.04+ / Rocky / Alma / CentOS 7+(部分) /
-#             Fedora / Alpine 3.15+ / Arch  (需 systemd)
+#             Fedora / Alpine 3.15+ / Arch  (systemd 或 OpenRC 均可)
 #  运行方式 : 以 root 运行   bash zihua.sh   (root 下直接运行即可, 无需 sudo)
+#  快捷命令 : 首次运行后自动安装 zihua 命令, 以后直接输入 zihua 即可再次打开
 #  统一内核 : sing-box (SS2022 / Hysteria2 / TUIC / VLESS-Reality-Vision /
 #             VLESS-Reality-gRPC 共用一个内核，一个服务多入站，方便增删改)
 #  多协议   : 各协议独立实例+独立证书, TCP/UDP 端口可复用, 可同时运行
-#  版本     : v1.1.0  (2026-10)
+#  附加功能 : 一键重装系统 (调用同仓库 reinstall-vm.sh, 支持 KVM/LXC)
+#  版本     : v1.2.0  (2026-10)
 #===============================================================================
 
 #--------------------------------- 全局变量 ------------------------------------
-PROXYBOX_VERSION="1.1.0"
+PROXYBOX_VERSION="1.2.0"
 SB_BIN="/usr/local/bin/sing-box"
 SB_DIR="/etc/sing-box"
 SB_ENV_DIR="$SB_DIR/instance.d"          # 每个协议一份参数(env)
@@ -23,6 +25,8 @@ SERVICE_NAME="sing-box-proxy"
 UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 SYSCTL_FILE="/etc/sysctl.d/99-proxybox-optimize.conf"
 PUB_IP=""
+INIT_SYS=""                                # systemd / openrc / none
+LOG_FILE="/var/log/sing-box-proxy.log"     # OpenRC 模式下的日志文件
 
 export PATH="$PATH:/usr/local/bin:/usr/local/sbin:/usr/sbin:/sbin"
 
@@ -241,8 +245,9 @@ ensure_deps() {
             zypper) zypper -n in -y iproute2 >/dev/null 2>&1 ;;
         esac
     fi
-    if ! command -v systemctl >/dev/null 2>&1 && [[ ! -d /run/systemd/system ]]; then
-        die "未检测到 systemd，本脚本需要 systemd 管理服务。Alpine 请确认安装了 systemd 或改用其他系统。"
+    [[ -n "$INIT_SYS" ]] || detect_init
+    if [[ "$INIT_SYS" == "none" ]]; then
+        die "未检测到 systemd / OpenRC，本脚本需要其中一种来管理服务。"
     fi
     for p in curl tar openssl; do
         command -v "$p" >/dev/null 2>&1 || die "缺少基础工具 $p ，请手动安装后重试。"
@@ -335,26 +340,38 @@ ask_port() {
 # 检测本机常见代理服务/进程，提示处理方式
 check_proxy_conflicts() {
     local pat='xray|v2ray|trojan|hysteria|shadowsocks|ss-server|ssr|naive|tuic|brook|gost|clash|mihomo|sing-box|snell|wmproxy'
-    local svc sname procs="" pid pn found=0
+    local svc sname procs="" pid pn pname found=0
     declare -A seen=()
     info "检查是否已有正在运行/自启的代理服务..."
-    for svc in $(systemctl list-unit-files --type=service --no-pager 2>/dev/null | awk '{print $1}' | grep -Ei "${pat}" | grep -v "^${SERVICE_NAME}.service$"); do
-        sname="${svc%.service}"
-        [[ "$sname" == "$SERVICE_NAME" ]] && continue
-        if systemctl is-active --quiet "$sname" 2>/dev/null; then
-            printf '%s  - %s%s %s(运行中)%s\n' "$YELLOW" "$NC" "$sname" "$GRAY" "$NC"
-            seen["$sname"]=1; found=1
-        elif systemctl is-enabled --quiet "$sname" 2>/dev/null; then
-            printf '%s  - %s%s %s(已启用开机自启, 当前未运行)%s\n' "$GRAY" "$NC" "$sname" "$GRAY" "$NC"
-            seen["$sname"]=1; found=1
-        fi
-    done
-    # 进程级兜底检查(排除本脚本管理的 sing-box 服务自身, 避免把自己当成冲突代理)
-    local own_pid
-    own_pid="$(systemctl show -p MainPID --value "$SERVICE_NAME" 2>/dev/null)"
-    [[ -z "$own_pid" || "$own_pid" == "0" ]] && own_pid=""
+    if [[ "$INIT_SYS" == "systemd" ]]; then
+        for svc in $(systemctl list-unit-files --type=service --no-pager 2>/dev/null | awk '{print $1}' | grep -Ei "${pat}" | grep -v "^${SERVICE_NAME}.service$"); do
+            sname="${svc%.service}"
+            [[ "$sname" == "$SERVICE_NAME" ]] && continue
+            if systemctl is-active --quiet "$sname" 2>/dev/null; then
+                printf '%s  - %s%s %s(运行中)%s\n' "$YELLOW" "$NC" "$sname" "$GRAY" "$NC"
+                seen["$sname"]=1; found=1
+            elif systemctl is-enabled --quiet "$sname" 2>/dev/null; then
+                printf '%s  - %s%s %s(已启用开机自启, 当前未运行)%s\n' "$GRAY" "$NC" "$sname" "$GRAY" "$NC"
+                seen["$sname"]=1; found=1
+            fi
+        done
+    else
+        for svc in $(ls /etc/init.d/ 2>/dev/null | grep -Ei "${pat}"); do
+            [[ "$svc" == "$SERVICE_NAME" || "$svc" == "functions.sh" || "$svc" == "sysfs" ]] && continue
+            if rc-service "$svc" status >/dev/null 2>&1; then
+                printf '%s  - %s%s %s(运行中)%s\n' "$YELLOW" "$NC" "$svc" "$GRAY" "$NC"
+                seen["$svc"]=1; found=1
+            elif rc-update show default 2>/dev/null | grep -qw "$svc"; then
+                printf '%s  - %s%s %s(已启用开机自启, 当前未运行)%s\n' "$GRAY" "$NC" "$svc" "$GRAY" "$NC"
+                seen["$svc"]=1; found=1
+            fi
+        done
+    fi
+    # 进程级兜底检查(排除本脚本管理的 sing-box 进程, 避免把自己当成冲突代理)
+    local own_pids
+    own_pids=" $(svc_own_pids) "
     for pn in $(pgrep -d' ' -f "${pat}" 2>/dev/null); do
-        [[ -n "$own_pid" && "$pn" == "$own_pid" ]] && continue
+        [[ "$own_pids" == *" $pn "* ]] && continue
         pname=$(ps -o comm= -p "$pn" 2>/dev/null | head -n1)
         [[ -n "$pname" && -z "${seen[$pname]:-}" ]] || continue
         printf '%s  - %s %s(PID %s 运行中)%s\n' "$YELLOW" "$pname" "$GRAY" "$pn" "$NC"
@@ -369,8 +386,13 @@ check_proxy_conflicts() {
         if [[ "$RESULT" == "1" ]]; then
             for sname in "${!seen[@]}"; do
                 info "停止 ${sname} ..."
-                systemctl stop "$sname" >/dev/null 2>&1
-                systemctl disable "$sname" >/dev/null 2>&1
+                if [[ "$INIT_SYS" == "systemd" ]]; then
+                    systemctl stop "$sname" >/dev/null 2>&1
+                    systemctl disable "$sname" >/dev/null 2>&1
+                else
+                    rc-service "$sname" stop >/dev/null 2>&1
+                    rc-update del "$sname" default >/dev/null 2>&1
+                fi
             done
             ok "已有代理已停止并禁用开机自启"
         fi
@@ -463,9 +485,48 @@ update_core() {
         for k in $(installed_keys); do
             gen_config "$k" || warn "配置 $k 重新校验失败，请查看日志"
         done
-        if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
-            systemctl restart "$SERVICE_NAME" && ok "服务已重启"
+        if svc_active; then
+            svc_do_restart && ok "服务已重启"
         fi
+    fi
+}
+
+#-------------------------- 初始化系统识别与服务管理封装 ---------------------------
+# 兼容 systemd (Debian/Ubuntu/RHEL系) 与 OpenRC (Alpine/Gentoo)
+detect_init() {
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+        INIT_SYS="systemd"
+    elif command -v rc-service >/dev/null 2>&1; then
+        INIT_SYS="openrc"
+    else
+        INIT_SYS="none"
+    fi
+}
+
+svc_do_start()    { if [[ "$INIT_SYS" == "systemd" ]]; then systemctl start "$SERVICE_NAME"; else rc-service "$SERVICE_NAME" start; fi; }
+svc_do_stop()     { if [[ "$INIT_SYS" == "systemd" ]]; then systemctl stop "$SERVICE_NAME"; else rc-service "$SERVICE_NAME" stop; fi; }
+svc_do_restart()  { if [[ "$INIT_SYS" == "systemd" ]]; then systemctl restart "$SERVICE_NAME"; else rc-service "$SERVICE_NAME" restart; fi; }
+svc_active()      { if [[ "$INIT_SYS" == "systemd" ]]; then systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; else rc-service "$SERVICE_NAME" status >/dev/null 2>&1; fi; }
+svc_status_text() { if [[ "$INIT_SYS" == "systemd" ]]; then systemctl is-active "$SERVICE_NAME" 2>/dev/null; else rc-service "$SERVICE_NAME" status 2>/dev/null | head -n1 | awk '{print $2}'; fi; }
+svc_enabled()     { if [[ "$INIT_SYS" == "systemd" ]]; then systemctl is-enabled --quiet "$1" 2>/dev/null; else rc-update show default 2>/dev/null | grep -qw "$1"; fi; }
+svc_enable()      { if [[ "$INIT_SYS" == "systemd" ]]; then systemctl enable "$SERVICE_NAME" >/dev/null 2>&1; else rc-update add "$SERVICE_NAME" default >/dev/null 2>&1; fi; }
+svc_disable_now() { if [[ "$INIT_SYS" == "systemd" ]]; then systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1; else rc-service "$SERVICE_NAME" stop >/dev/null 2>&1; rc-update del "$SERVICE_NAME" default >/dev/null 2>&1; fi; }
+svc_show_status() { if [[ "$INIT_SYS" == "systemd" ]]; then systemctl status "$SERVICE_NAME" --no-pager -l 2>/dev/null | head -n 25; else rc-service "$SERVICE_NAME" status 2>/dev/null; grep -A3 "^#!/sbin/openrc-run" /etc/init.d/"$SERVICE_NAME" 2>/dev/null | head -n 4; fi; }
+svc_own_pids() {
+    # 本脚本管理的 sing-box 进程 PID(用于冲突检测排除自身)
+    if [[ "$INIT_SYS" == "systemd" ]]; then
+        local p; p="$(systemctl show -p MainPID --value "$SERVICE_NAME" 2>/dev/null)"
+        [[ -n "$p" && "$p" != "0" ]] && echo "$p"
+    else
+        pgrep -f "$SB_BIN run -C" 2>/dev/null | tr '\n' ' '
+    fi
+}
+svc_log_tail() {
+    # $1 = 行数
+    if [[ "$INIT_SYS" == "systemd" ]]; then
+        journalctl -u "$SERVICE_NAME" -n "${1:-60}" --no-pager -e 2>/dev/null
+    else
+        tail -n "${1:-60}" "$LOG_FILE" 2>/dev/null
     fi
 }
 
@@ -476,7 +537,33 @@ ensure_dirs() {
 }
 
 ensure_service() {
-    if [[ -f "$UNIT_PATH" ]]; then return 0; fi
+    if [[ "$INIT_SYS" == "openrc" ]] && [[ -x "/etc/init.d/${SERVICE_NAME}" ]]; then return 0; fi
+    if [[ "$INIT_SYS" == "systemd" ]] && [[ -f "$UNIT_PATH" ]]; then return 0; fi
+    if [[ "$INIT_SYS" == "openrc" ]]; then
+        cat > "/etc/init.d/${SERVICE_NAME}" <<UNIT
+#!/sbin/openrc-run
+description="ProxyBox sing-box multi-inbound service"
+command="${SB_BIN}"
+command_args="run -C ${SB_CFG_DIR}"
+command_background="yes"
+pidfile="/run/${SERVICE_NAME}.pid"
+output_log="${LOG_FILE}"
+error_log="${LOG_FILE}"
+depend() {
+    need net
+    use dns
+}
+start_pre() {
+    ebegin "检查 sing-box 配置"
+    ${SB_BIN} check -C ${SB_CFG_DIR}
+    eend \$?
+}
+UNIT
+        chmod +x "/etc/init.d/${SERVICE_NAME}"
+        svc_enable
+        ok "已创建并启用 OpenRC 服务: $SERVICE_NAME"
+        return 0
+    fi
     cat > "$UNIT_PATH" <<UNIT
 [Unit]
 Description=ProxyBox sing-box multi-inbound service
@@ -502,13 +589,13 @@ UNIT
 
 svc_restart() {
     ensure_service
-    if ! systemctl restart "$SERVICE_NAME"; then
+    if ! svc_do_restart; then
         err "服务重启失败，最近日志如下:"
-        journalctl -u "$SERVICE_NAME" -n 20 --no-pager 2>/dev/null | sed 's/^/    /'
+        svc_log_tail 20 | sed 's/^/    /'
         return 1
     fi
     sleep 1
-    systemctl is-active --quiet "$SERVICE_NAME" && ok "服务运行中" || warn "服务状态异常，请查看日志"
+    svc_active && ok "服务运行中" || warn "服务状态异常，请查看日志"
 }
 
 #--------------------------------- 配置/env 管理 ----------------------------------
@@ -591,10 +678,12 @@ acme_issue_cert() {
         return 1
     fi
     mkdir -p "$SB_CERT_DIR"
+    local reload_cmd
+    if [[ "$INIT_SYS" == "systemd" ]]; then reload_cmd="systemctl restart $SERVICE_NAME"; else reload_cmd="rc-service $SERVICE_NAME restart"; fi
     if ! "$acme" --install-cert -d "$domain" --ecc \
             --fullchain-file "$SB_CERT_DIR/$k.pem" \
             --key-file "$SB_CERT_DIR/$k.key" \
-            --reloadcmd "systemctl restart $SERVICE_NAME 2>/dev/null" >/dev/null 2>&1; then
+            --reloadcmd "$reload_cmd" >/dev/null 2>&1; then
         err "证书安装失败。"
         return 1
     fi
@@ -1231,7 +1320,7 @@ menu_list() {
     printf '  %-10s %-28s %-8s %s\n' "协议" "说明" "端口" "转发状态"
     hr
     local proto proto_name port st
-    st="禁用"; systemctl is-active --quiet "$SERVICE_NAME" && st="$(systemctl is-active $SERVICE_NAME)"
+    st="禁用"; svc_active && st="$(svc_status_text)"
     for k in "${keys[@]}"; do
         load_env "$k"
         case "$k" in
@@ -1245,7 +1334,7 @@ menu_list() {
         printf '  %-10s %-32s %-8s %s\n' "$k" "$proto_name" "${PORT}" "$st"
     done
     hr
-    info "sing-box 状态: $(systemctl is-active $SERVICE_NAME 2>/dev/null || echo 未安装)   版本: $("$SB_BIN" version 2>/dev/null | head -n1 || echo 未知)"
+    info "sing-box 状态: $(svc_active && echo 运行中 || echo 未运行)   版本: $("$SB_BIN" version 2>/dev/null | head -n1 || echo 未知)"
     return 0
 }
 
@@ -1502,7 +1591,7 @@ menu_delete() {
             2 "彻底卸载(服务+sing-box程序+所有配置)" \
             3 "什么都不做"
         case "$RESULT" in
-            1) systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1; ok "服务已停止并禁用自启" ;;
+            1) svc_disable_now; ok "服务已停止并禁用自启" ;;
             2) uninstall_all ;;
         esac
     else
@@ -1519,28 +1608,36 @@ menu_service() {
         3 "重启服务" \
         4 "查看服务状态"
     case "$RESULT" in
-        1) systemctl start "$SERVICE_NAME" && ok "已启动" ;;
-        2) systemctl stop "$SERVICE_NAME" && ok "已停止" ;;
+        1) svc_do_start && ok "已启动" ;;
+        2) svc_do_stop && ok "已停止" ;;
         3) svc_restart ;;
-        4) systemctl status "$SERVICE_NAME" --no-pager -l 2>/dev/null | head -n 25 ;;
+        4) svc_show_status ;;
     esac
     pause
 }
 
 menu_logs() {
     title "查看日志(最近 60 行)"
-    journalctl -u "$SERVICE_NAME" -n 60 --no-pager -e 2>/dev/null | sed 's/^/  /'
-    info "持续跟踪: journalctl -u $SERVICE_NAME -f"
+    svc_log_tail 60 | sed 's/^/  /'
+    if [[ "$INIT_SYS" == "systemd" ]]; then
+        info "持续跟踪: journalctl -u $SERVICE_NAME -f"
+    else
+        info "持续跟踪: tail -f $LOG_FILE"
+    fi
     pause
 }
 
 uninstall_core() {
-    if [[ -f "$UNIT_PATH" ]]; then
+    if [[ "$INIT_SYS" == "systemd" && -f "$UNIT_PATH" ]]; then
         systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1
         rm -f "$UNIT_PATH"
         systemctl daemon-reload
+    elif [[ "$INIT_SYS" == "openrc" && -x "/etc/init.d/${SERVICE_NAME}" ]]; then
+        rc-service "$SERVICE_NAME" stop >/dev/null 2>&1
+        rc-update del "$SERVICE_NAME" default >/dev/null 2>&1
+        rm -f "/etc/init.d/${SERVICE_NAME}"
     fi
-    rm -f "$SB_BIN"
+    rm -f "$SB_BIN" "$LOG_FILE" "/run/${SERVICE_NAME}.pid"
     ok "sing-box 内核与服务已卸载"
 }
 
@@ -1789,6 +1886,37 @@ menu_manage() {
     done
 }
 
+#--------------------------------- 重装系统 ----------------------------------------
+menu_reinstall() {
+    title "重装系统(极度危险)"
+    warn "重装会清空本机全部数据(代理配置/网站/数据库/本脚本都会消失)，过程不可中断！"
+    warn "执行前请确认: ①本机没有需要保留的数据 ②知道服务商 VNC/控制台入口 ③记录好重装时设置的 root 密码。"
+    info "重装由同仓库的 reinstall-vm.sh 完成: KVM 走 netboot+preseed 全自动安装, LXC/容器走 rootfs 原位替换。"
+    ask "确认继续? 输入 yes 进入重装菜单" "no"
+    [[ "$RESULT" != "yes" ]] && { info "已取消"; return; }
+    local rf="/usr/local/bin/reinstall-vm.sh" okdl=0 u base
+    if [[ ! -f "$rf" ]]; then
+        info "下载重装脚本 reinstall-vm.sh ..."
+        base="https://raw.githubusercontent.com/xiaoluaibb/zihua/main/reinstall-vm.sh"
+        while IFS= read -r u; do
+            [[ -z "$u" ]] && continue
+            printf '%s    下载: %s%s\n' "$GRAY" "$u" "$NC"
+            if curl -fsSL --connect-timeout 8 --max-time 120 -o "$rf" "$u" 2>/dev/null && [[ -s "$rf" ]] && head -n1 "$rf" | grep -q "bin/"; then
+                okdl=1; break
+            fi
+        done <<EOF
+$base
+https://gh-proxy.com/$base
+https://ghfast.top/$base
+EOF
+        if [[ "$okdl" != "1" ]]; then rm -f "$rf"; err "下载失败, 请检查网络后重试"; return; fi
+        chmod 700 "$rf"
+        ok "已保存到 $rf (以后可直接 bash $rf 单独运行)"
+    fi
+    info "启动重装脚本(交互式菜单, 随时输入 q 可退出)..."
+    bash "$rf" || true
+}
+
 #--------------------------------- 封面/主菜单 -------------------------------------
 banner() {
     clear 2>/dev/null || true
@@ -1820,6 +1948,7 @@ main_menu() {
         echo "  ${BOLD}2)${NC} 代理管理 (查看/修改/删除/日志/更新/卸载)"
         echo "  ${BOLD}3)${NC} 网络优化 (BBR / 内核调优)"
         echo "  ${BOLD}4)${NC} 系统与依赖体检"
+        echo "  ${BOLD}5)${NC} 重装系统 (调用 reinstall-vm.sh, 危险!)"
         echo "  ${BOLD}0)${NC} 退出"
         hr
         ask "请选择" "1"
@@ -1828,6 +1957,7 @@ main_menu() {
             2) menu_manage ;;
             3) menu_network ;;
             4) show_system_info; ensure_deps; pause ;;
+            5) menu_reinstall ;;
             0) ok "再见!"; exit 0 ;;
             *) err "请输入正确编号" ;;
         esac
@@ -1860,19 +1990,34 @@ main() {
     elif [[ "$idok" == "0" ]]; then
         warn "未识别的系统发行版 (${OS_ID:-未知})，脚本会尽力尝试但可能失败。"
     fi
-    check_systemd || true
+    check_init || true
     ensure_deps || true
     get_public_ip >/dev/null 2>&1 || true
+    install_zihua_cmd
     main_menu
 }
 
-# 检查 systemd 是否可用
-check_systemd() {
-    if ! command -v systemctl >/dev/null 2>&1; then
-        warn "未检测到 systemctl / systemd，服务管理功能不可用。"
+# 检查初始化系统是否可用 (systemd 或 OpenRC)
+check_init() {
+    detect_init
+    if [[ "$INIT_SYS" == "none" ]]; then
+        warn "未检测到 systemd / OpenRC，服务管理功能不可用。"
         return 1
     fi
+    ok "初始化系统: $INIT_SYS"
     return 0
+}
+
+# 安装/更新 zihua 快捷命令: 以后直接输入 zihua 即可再次运行
+install_zihua_cmd() {
+    local self dest="/usr/local/bin/zihua"
+    self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+    [[ -z "$self" || "$self" == "$dest" ]] && return 0
+    if ! cmp -s "$self" "$dest" 2>/dev/null; then
+        if install -m 700 "$self" "$dest" 2>/dev/null; then
+            ok "快捷命令已就绪: 以后直接输入 zihua 即可再次打开本脚本"
+        fi
+    fi
 }
 
 main "$@"
