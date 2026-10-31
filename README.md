@@ -31,6 +31,12 @@ bash zihua.sh
   - TUIC
   - VLESS-Reality-Vision
   - VLESS-Reality-gRPC
+- 多协议同时运行：各协议独立实例与独立证书，TCP 与 UDP 端口可同号并存（如 Vision 用 TCP 443，Hysteria2 用 UDP 443）
+- Reality 偷域名：内置大厂域名可选（也可偷自己的域名），选择后自动测试目标是否支持 TLS1.3
+- TLS 证书三种来源（Hysteria2 / TUIC）：
+  1. 自签证书：无域名一键生成，客户端开『允许不安全』
+  2. 已有证书文件：填 acme.sh / certbot / 宝塔 签发的 pem + key 路径
+  3. acme.sh 自动申请：自有域名解析到本机即可，全自动签发 + 自动续期
 - 交互式菜单：安装、新增 / 修改 / 删除协议实例、查看配置
 - 网络优化：BBR 开启与内核参数调优（`/etc/sysctl.d/99-proxybox-optimize.conf`）
 - 配置安全：每次修改前自动备份到 `/etc/sing-box/backup`
