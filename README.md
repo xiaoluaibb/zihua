@@ -16,6 +16,19 @@ wget -P /root -N --no-check-certificate "https://raw.githubusercontent.com/xiaol
 curl -kfsSL "https://raw.githubusercontent.com/xiaoluaibb/zihua/main/zihua.sh" -o /root/zihua.sh && chmod 700 /root/zihua.sh && /root/zihua.sh
 ```
 
+### Alpine 系统专用
+
+Alpine 自带的 BusyBox wget 不支持 `-N` / `--no-check-certificate` 参数，且默认没有 bash，请用：
+
+```sh
+apk add bash curl openssl tar
+wget -O /root/zihua.sh "https://raw.githubusercontent.com/xiaoluaibb/zihua/main/zihua.sh"
+chmod 700 /root/zihua.sh
+bash /root/zihua.sh
+```
+
+注意：脚本依赖 systemd 管理服务。用 OpenRC 的原生 Alpine 无法运行（脚本会提示未检测到 systemd）；只有安装了 systemd 的 Alpine（少见）可用。
+
 ## 手动下载运行
 
 ```bash
