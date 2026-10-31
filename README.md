@@ -27,7 +27,7 @@ chmod 700 /root/zihua.sh
 bash /root/zihua.sh
 ```
 
-注意：脚本依赖 systemd 管理服务。用 OpenRC 的原生 Alpine 无法运行（脚本会提示未检测到 systemd）；只有安装了 systemd 的 Alpine（少见）可用。
+v1.2.0 起原生支持 Alpine（OpenRC 服务管理），无需 systemd。首次运行后会自动安装 `zihua` 快捷命令，之后直接输入 `zihua` 即可再次打开菜单。
 
 ## 手动下载运行
 
@@ -51,6 +51,9 @@ bash zihua.sh
   2. 已有证书文件：填 acme.sh / certbot / 宝塔 签发的 pem + key 路径
   3. acme.sh 自动申请：自有域名解析到本机即可，全自动签发 + 自动续期
 - 交互式菜单：安装、新增 / 修改 / 删除协议实例、查看配置
+- 系统兼容：systemd 与 OpenRC 双支持（Alpine 原生可用，无需 systemd）
+- 快捷命令：首次运行后自动安装 `zihua` 命令，以后直接输入 `zihua` 即可再次打开
+- 一键重装系统：主菜单第 5 项，调用同仓库 `reinstall-vm.sh`（KVM netboot+preseed 全自动 / LXC rootfs 原位替换，支持 Debian/Ubuntu/Alpine/Rocky 等十余种系统）
 - 网络优化：BBR 开启与内核参数调优（`/etc/sysctl.d/99-proxybox-optimize.conf`）
 - 配置安全：每次修改前自动备份到 `/etc/sing-box/backup`
 
