@@ -52,7 +52,12 @@ bash zihua.sh
 - 系统兼容：systemd 与 OpenRC 双支持（Alpine 原生可用，无需 systemd）
 - 快捷命令：首次运行后自动安装 `zihua` 命令，以后直接输入 `zihua` 即可再次打开
 - 一键重装系统：主菜单第 5 项，调用同仓库 `reinstall-vm.sh`（KVM netboot+preseed 全自动 / LXC rootfs 原位替换，支持 Debian/Ubuntu/Alpine/Rocky 等十余种系统）
-- 网络优化：BBR 开启与内核参数调优（`/etc/sysctl.d/99-proxybox-optimize.conf`）
+- 网络优化：BBR 开启与内核参数调优（写入 `/etc/sysctl.d/99-proxybox-optimize.conf`）
+  - 完整参数集 34 项：BBR + fq 队列、收发缓冲、并发队列（somaxconn / backlog / SYN）、TCP FastOpen、TIME_WAIT 复用、本地端口范围、UDP 缓冲（QUIC / Hysteria2）、conntrack 上限等
+  - 收发缓冲按**物理内存自动缩放**（≤384M→8M，≤768M→16M，≤1.5G→32M，≤3G→48M，≤6G→64M，更大→128M），小内存机型不会因为照抄 64M/128M 而 OOM
+  - 逐条应用：先检测该参数在当前内核是否存在，不存在的自动跳过并在结束时列出，不会像 `sysctl -p` 那样一条报错就整批中断
+  - 支持精确回滚：首次调优前把原值记录到 `/etc/sysctl.d/proxybox-optimize.orig`，菜单『恢复默认参数』按原值逐项还原
+  - Alpine 下自动检查并启用 `sysctl` 开机服务（`rc-update add sysctl boot`）
 - 配置安全：每次修改前自动备份到 `/etc/sing-box/backup`
 
 ## 系统要求
