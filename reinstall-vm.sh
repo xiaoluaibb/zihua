@@ -32,6 +32,8 @@
 #   Debian Installer 官方 preseed 文档 (apbs02 / example-preseed)
 # ============================================================================
 
+REINSTALL_VM_VERSION="1.1.0"
+
 LC_ALL=C
 set -u
 [ -n "${BASH_VERSION:-}" ] || exec bash "$0" "$@"
@@ -49,12 +51,11 @@ warn()    { printf '%s[注意]%s %s\n'  "$CY" "$C0" "$*"; }
 err()     { printf '%s[错误]%s %s\n'  "$CR" "$C0" "$*"; }
 die()     { err "$*"; exit 1; }
 
-confirm() { # confirm <提示> —— 输入 yes 才返回 0
+confirm() { # confirm <提示> —— 输入 y/yes 才返回 0
     local reply
-    printf '%s[确认]%s %s %s' "$CY" "$C0" "$*" "$CD"
+    printf '%s[确认]%s %s %s[y/N]%s: ' "$CY" "$C0" "$*" "$CD" "$C0"
     read -r reply
-    printf '%s\n' "$C0"
-    [ "$reply" = "yes" ]
+    case $reply in y|Y|yes|YES|Yes) return 0 ;; *) return 1 ;; esac
 } # ask <变量名> <提示> [默认值]
 ask() {
     local __var=$1 __msg=$2 __def=${3:-} reply
@@ -76,7 +77,8 @@ pick() { # pick <标题> <选项文件路径> ; 结果存 MENU_RESULT, 取消返
     done <"$__file"
     printf '%s q%s) %s\n' "$CD" "$C0" "返回/取消"
     while :; do
-        printf '%s请输入编号>%s ' "$CB" "$C0"; read -r choice
+        printf '%s请输入编号>%s ' "$CB" "$C0"; read -r choice || return 9
+        [ -z "$choice" ] && continue
         if [ "$choice" = q ] || [ "$choice" = Q ]; then return 9; fi
         if awk -F'|' -v k="$choice" '$1==k {found=1} END{exit found?0:1}' "$__file" 2>/dev/null; then
             MENU_RESULT=$choice
@@ -273,26 +275,30 @@ Arch Linux (LXC)|arch|current|l|256|1600|滚动更新
 
 # 把 CATALOG 展开成可选菜单文件; 过滤当前环境; 标注内存/磁盘不足
 build_distro_menu() { # build_distro_menu <输出文件> <环境过滤: k|l|空=全部> <是否只显示轻量>
+    # 输出两个文件: <out> 为 "编号|展示文本", <out>.map 为 "编号|label|distro|release|minram|mindisk"
     local out=$1 flt=$2 light=${3:-0}
-    : >"$out"
-    local label distro release envs minram mindisk note
+    : >"$out"; : >"$out.map"
+    local label distro release envs minram mindisk note n=0 hint=""
     while IFS='|' read -r label distro release envs minram mindisk note; do
         [ -z "$label" ] && continue
         if [ -n "$flt" ]; then
             case ",$envs," in *",$flt,"*) ;; *) continue ;; esac
         fi
-        local hint=""
+        if [ "$light" = 1 ]; then
+            case $distro in alpine|debian) ;; *) continue ;; esac
+        fi
+        hint=""
         # 资源校验 (KVM 额外要求安装期内存 >= 最低内存 - 表中已含)
         if [ "$RAM_MB" -lt "$minram" ]; then
             hint=" ${CR}内存不足(需${minram}MB)$C0"
         elif [ "$DISK_AVAIL_MB" -lt "$mindisk" ]; then
             hint=" ${CR}磁盘空间不足(需~$((mindisk/1024))GB)$C0"
         fi
-        if [ "$light" = 1 ]; then
-            case $distro in alpine|debian) ;; *) continue ;; esac
-        fi
-        printf '%s|%s %-26s RAM>%sM 磁盘>%sM %s%s\n' \
-            "$label" "$label" "[$distro $release]" "$minram" "$mindisk" "$note" "$hint" >>"$out"
+        n=$((n + 1))
+        printf '%d|%s  [%s %s]  RAM>%sM 磁盘>%sM  %s%s\n' \
+            "$n" "$label" "$distro" "$release" "$minram" "$mindisk" "$note" "$hint" >>"$out"
+        printf '%d|%s|%s|%s|%s|%s\n' \
+            "$n" "$label" "$distro" "$release" "$minram" "$mindisk" >>"$out.map"
     done <<<"$CATALOG"
 }
 
@@ -318,24 +324,35 @@ recommend() {
 
 # ---------------------------------------------------------------- 选项收集
 OPT_PASS= OPT_HASH= OPT_PORT=22 OPT_TZ= OPT_SWAP=auto OPT_KEEPKEY=1
-OPT_NET_MODE=dhcp OPT_MIRROR=official OPT_KVMTASK=minimal
+OPT_NET_MODE=dhcp OPT_MIRROR=official OPT_KVMTASK=minimal OPT_MIRROR_URL=
 
 ask_options() {
-    local choice of
+    local choice of mir_label task_label keepkey_label net_label envname
     while :; do
+        case $OPT_MIRROR in
+            official) mir_label="官方源" ;;
+            tuna)     mir_label="TUNA(大陆加速)" ;;
+            aliyun)   mir_label="Aliyun(大陆加速)" ;;
+            custom)   mir_label="自定义 ${OPT_MIRROR_URL:-未填写URL}" ;;
+            *)        mir_label="$OPT_MIRROR" ;;
+        esac
+        if [ "$OPT_NET_MODE" = dhcp ]; then net_label="DHCP 自动获取"; else net_label="静态IP(沿用当前配置)"; fi
+        if [ "$OPT_KVMTASK" = minimal ]; then task_label="最小化(仅ssh)"; else task_label="标准(含常用工具)"; fi
+        if [ "$OPT_KEEPKEY" = 1 ]; then keepkey_label="是"; else keepkey_label="否"; fi
+        [ "$VIRT" = lxc ] && envname=LXC || envname=KVM
         of=$(mktemp)
-        cat >"$of" <<EOF
-1|root 密码        : ${CY}${OPT_PASS:+已设置}${OPT_PASS:-未设置(将随机生成)}${C0}
-2|SSH 端口         : ${OPT_PORT}
-3|安装源           : $(case $OPT_MIRROR in official) echo 官方原图;; tuna) echo TUNA(大陆加速);; aliyun) echo Aliyun(大陆加速);; custom) echo 自定义;; esac)
-4|网络             : $( [ "$OPT_NET_MODE" = dhcp ] && echo 'DHCP 自动获取' || echo '静态IP (沿用当前配置)' )
-5|时区             : ${OPT_TZ:-跟随当前(未知则UTC)}
-6|swap 大小        : $OPT_SWAP (KVM)
-7|安装任务         : $( [ $OPT_KVMTASK = minimal ] && echo 最小化(仅ssh) || echo 标准(含常用工具) ) (KVM)
-8|保留原SSH公钥    : $([ $OPT_KEEPKEY = 1 ] && echo 是 || echo 否) (LXC)
-s|—————— 开始安装 ——————
-EOF
-        pick "安装选项 (当前: $( [ "$VIRT" = lxc ] && echo LXC || echo KVM ))" "$of" || { rm -f "$of"; return 9; }
+        {
+            printf '1|root 密码        : %s%s%s\n' "$CY" "${OPT_PASS:-未设置(将随机生成)}" "$C0"
+            printf '2|SSH 端口         : %s\n' "$OPT_PORT"
+            printf '3|安装源           : %s\n' "$mir_label"
+            printf '4|网络             : %s\n' "$net_label"
+            printf '5|时区             : %s\n' "${OPT_TZ:-跟随当前(未知则UTC)}"
+            printf '6|swap 大小        : %s (KVM)\n' "$OPT_SWAP"
+            printf '7|安装任务         : %s (KVM)\n' "$task_label"
+            printf '8|保留原SSH公钥    : %s (LXC)\n' "$keepkey_label"
+            printf 's|—————— 开始安装 ——————\n'
+        } >"$of"
+        pick "安装选项 (当前: $envname)" "$of" || { rm -f "$of"; return 9; }
         rm -f "$of"
         choice=$MENU_RESULT
         case $choice in
@@ -366,8 +383,12 @@ EOF
                    1) OPT_MIRROR=official ;;
                    2) OPT_MIRROR=tuna ;;
                    3) OPT_MIRROR=aliyun ;;
-                   4) ask OPT_MIRROR "请输入镜像 base URL (如 https://mirrors.example.com/debian)" "https://"
-                      case $OPT_MIRROR in https://*|http://*) OPT_MIRROR=custom ;; *) warn "无效 URL"; OPT_MIRROR=official ;; esac ;;
+                   4) local mu
+                      ask mu "请输入镜像 base URL (如 https://mirrors.example.com/debian)" "${OPT_MIRROR_URL:-https://}"
+                      case $mu in
+                          https://*|http://*) OPT_MIRROR=custom; OPT_MIRROR_URL=${mu%/} ;;
+                          *) warn "无效 URL, 已回退官方源"; OPT_MIRROR=official; OPT_MIRROR_URL= ;;
+                      esac ;;
                esac ;;
             4) local nf; nf=$(mktemp)
                cat >"$nf" <<'EOF'
@@ -391,6 +412,8 @@ EOF
                pick "Debian/Ubuntu 安装任务" "$tf" || { rm -f "$tf"; continue; }
                rm -f "$tf"; OPT_KVMTASK=$([ "$MENU_RESULT" = 1 ] && echo minimal || echo standard) ;;
             8) [ "$OPT_KEEPKEY" = 1 ] && OPT_KEEPKEY=0 || OPT_KEEPKEY=1 ;;
+            s|S) return 0 ;;
+            *) warn "无效编号: $choice" ;;
         esac
     done
 }
@@ -448,7 +471,7 @@ kvm_resolve_mirror() { # 设置 KVM_MIRROR (镜像站 base, 如 https://deb.debi
                   else KVM_MIRROR=http://archive.ubuntu.com/ubuntu; fi ;;
         tuna)     KVM_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/$KVM_DISTRO ;;
         aliyun)   KVM_MIRROR=https://mirrors.aliyun.com/$KVM_DISTRO ;;
-        custom)   KVM_MIRROR=$OPT_MIRROR ;;
+        custom)   KVM_MIRROR=$OPT_MIRROR_URL ;;
         *) KVM_MIRROR= ;;
     esac
 }
@@ -700,7 +723,7 @@ lxc_resolve_base() {
         tuna)     LXC_BASE=https://mirrors.tuna.tsinghua.edu.cn/lxc-images/images/$distro ;;
         aliyun)   warn "该镜像站暂无 LXC rootfs 镜像, 已回退官方源"
                   LXC_BASE=https://images.linuxcontainers.org/images/$distro ;;
-        custom)   LXC_BASE=$OPT_MIRROR/images/$distro ;;
+        custom)   LXC_BASE=${OPT_MIRROR_URL%/}/images/$distro ;;
         *)        LXC_BASE=https://images.linuxcontainers.org/images/$distro ;;
     esac
 }
@@ -1071,25 +1094,30 @@ DISTRO= RELEASE= RELEASE_LABEL=
 
 choose_system() {
     local envflag=$VIRT; [ "$VIRT" = kvm ] && envflag=k || envflag=l
-    local cf seen
+    local cf
     cf=$(mktemp)
     while :; do
         recommend
         show_hw_summary; show_net_summary
         build_distro_menu "$cf" "$envflag" 0
         if [ ! -s "$cf" ]; then
+            rm -f "$cf" "$cf.map"
             die "当前环境/资源没有可选系统 (内存或磁盘过小)"
         fi
-        pick "选择要重装的系统 (当前为 $( [ $VIRT = lxc ] && echo 'LXC 容器' || echo 'KVM 虚拟机' ))" "$cf" || { rm -f "$cf"; return 9; }
-        rm -f "$cf"
-        while IFS='|' read -r label distro release envs minram mindisk note; do
-            [ "$label" = "$MENU_RESULT" ] && {
+        pick "选择要重装的系统 (当前为 $( [ $VIRT = lxc ] && echo 'LXC 容器' || echo 'KVM 虚拟机' ))" "$cf" || { rm -f "$cf" "$cf.map"; return 9; }
+        local sel=$MENU_RESULT n label distro release minram mindisk found=0
+        if [ -f "$cf.map" ]; then
+            while IFS='|' read -r n label distro release minram mindisk; do
+                [ "$n" = "$sel" ] || continue
                 DISTRO=$distro; RELEASE=$release; RELEASE_LABEL=$label
                 [ "$RAM_MB" -lt "$minram" ] && { warn "内存 $RAM_MB MB 低于该系统最低要求 $minram MB, 强行安装可能失败!"; }
                 [ "$DISK_AVAIL_MB" -lt "$mindisk" ] && { warn "磁盘可用 $DISK_AVAIL_MB MB 低于该系统最低要求约 $mindisk MB, 强行安装可能失败!"; }
-                return 0
-            }
-        done <<<"$CATALOG"
+                found=1
+                break
+            done <"$cf.map"
+        fi
+        rm -f "$cf" "$cf.map"
+        [ "$found" = 1 ] && return 0
         warn "无效选择"
     done
 }
@@ -1133,10 +1161,9 @@ main_menu() {
         cat >"$mf" <<EOF
 1|开始重装 (交互式选择系统, 附推荐)
 2|查看硬件需求对照表
-q|退出
 EOF
         show_hw_summary
-        pick "reinstall-vm.sh 主菜单" "$mf" || { rm -f "$mf"; exit 0; }
+        pick "reinstall-vm.sh 主菜单 (v$REINSTALL_VM_VERSION)" "$mf" || { rm -f "$mf"; exit 0; }
         rm -f "$mf"
         case $MENU_RESULT in
             1) run_install ;;
