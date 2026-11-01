@@ -15,7 +15,7 @@
 #===============================================================================
 
 #--------------------------------- 全局变量 ------------------------------------
-PROXYBOX_VERSION="1.4.4"
+PROXYBOX_VERSION="1.4.5"
 SB_BIN="/usr/local/bin/sing-box"
 SB_DIR="/etc/sing-box"
 SB_ENV_DIR="$SB_DIR/instance.d"          # 每个协议一份参数(env)
@@ -27,6 +27,10 @@ XRAY_BIN="/usr/local/bin/xray"                        # Xray 内核(Reality 协�
 XRAY_CFG="/etc/sing-box/xray.json"                    # Xray 合并配置(所有 Reality 入站)
 XRAY_SERVICE="zihua-xray"                             # Xray 服务名
 XRAY_LOG_FILE="/var/log/zihua-xray.log"
+# 固定 Xray 版本: >=v26.9.8 的 Reality 服务端强制要求客户端 ClientHello 携带后量子密钥交换
+# (X25519MLKEM768), 旧版 sing-box/Mihomo 等客户端不带该扩展 → reality verification failed。
+# v26.7.11 起又默认启用 minClientVer 拒绝旧客户端, 故固定在 v26.6.27 (无这两个坑)。
+XRAY_PIN_VER="v26.6.27"
 UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 SYSCTL_FILE="/etc/sysctl.d/99-proxybox-optimize.conf"
 PUB_IP=""
@@ -645,7 +649,7 @@ xray_download_urls() {
         arm64) fname="Xray-linux-arm64-v8a.zip" ;;
         *) return 1 ;;
     esac
-    local u="https://github.com/XTLS/Xray-core/releases/latest/download/${fname}"
+    local u="https://github.com/XTLS/Xray-core/releases/download/${XRAY_PIN_VER}/${fname}"
     echo "$u"
     echo "https://gh-proxy.com/${u}"
     echo "https://ghfast.top/${u}"
@@ -692,7 +696,17 @@ install_xray() {
 }
 
 ensure_xray_core() {
-    if [[ -x "$XRAY_BIN" ]] && "$XRAY_BIN" version >/dev/null 2>&1; then return 0; fi
+    # 已装 Xray 版本若与固定版本不一致(尤其新版>=v26.9.8 强制后量子), 自动重装固定版本
+    if [[ -x "$XRAY_BIN" ]]; then
+        local cur
+        cur="$("$XRAY_BIN" version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
+        if [[ -n "$cur" && "$cur" == "${XRAY_PIN_VER#v}" ]]; then
+            return 0
+        fi
+        if [[ -n "$cur" ]]; then
+            warn "检测到 Xray $cur 与固定版本 ${XRAY_PIN_VER} 不一致(新版会强制后量子密钥交换, 旧客户端会 reality verification failed), 重新安装 ${XRAY_PIN_VER}..."
+        fi
+    fi
     install_xray
 }
 
