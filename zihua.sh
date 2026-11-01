@@ -6,15 +6,16 @@
 #             Fedora / Alpine 3.15+ / Arch  (systemd 或 OpenRC 均可)
 #  运行方式 : 以 root 运行   bash zihua.sh   (root 下直接运行即可, 无需 sudo)
 #  快捷命令 : 首次运行后自动安装 zihua 命令, 以后直接输入 zihua 即可再次打开
-#  统一内核 : sing-box (SS2022 / Hysteria2 / TUIC / VLESS-Reality-Vision /
-#             VLESS-Reality-gRPC 共用一个内核，一个服务多入站，方便增删改)
+#  双内核   : sing-box (SS2022 / Hysteria2 / TUIC)
+#             Xray (VLESS-Reality-Vision / gRPC, 配置与 v2ray-agent 同款)
+#             两个服务独立管理, 可同时运行
 #  多协议   : 各协议独立实例+独立证书, TCP/UDP 端口可复用, 可同时运行
 #  附加功能 : 一键重装系统 (调用同仓库 reinstall-vm.sh, 支持 KVM/LXC)
 #  版本     : v1.3.0  (2026-11)
 #===============================================================================
 
 #--------------------------------- 全局变量 ------------------------------------
-PROXYBOX_VERSION="1.3.0"
+PROXYBOX_VERSION="1.4.0"
 SB_BIN="/usr/local/bin/sing-box"
 SB_DIR="/etc/sing-box"
 SB_ENV_DIR="$SB_DIR/instance.d"          # 每个协议一份参数(env)
@@ -22,6 +23,10 @@ SB_CFG_DIR="$SB_DIR/configs"             # 每个协议一份配置(json)
 SB_CERT_DIR="$SB_DIR/certs"              # 自签证书
 SB_BAK_DIR="$SB_DIR/backup"              # 修改前的配置备份
 SERVICE_NAME="sing-box-proxy"
+XRAY_BIN="/usr/local/bin/xray"                        # Xray 内核(Reality 协议专用, v2ray-agent 同款)
+XRAY_CFG="/etc/sing-box/xray.json"                    # Xray 合并配置(所有 Reality 入站)
+XRAY_SERVICE="zihua-xray"                             # Xray 服务名
+XRAY_LOG_FILE="/var/log/zihua-xray.log"
 UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 SYSCTL_FILE="/etc/sysctl.d/99-proxybox-optimize.conf"
 PUB_IP=""
@@ -367,9 +372,9 @@ check_proxy_conflicts() {
             fi
         done
     fi
-    # 进程级兜底检查(排除本脚本管理的 sing-box 进程, 避免把自己当成冲突代理)
+    # 进程级兜底检查(排除本脚本管理的 sing-box/Xray 进程, 避免把自己当成冲突代理)
     local own_pids
-    own_pids=" $(svc_own_pids) "
+    own_pids=" $(svc_own_pids) $(command -v "$XRAY_BIN" >/dev/null 2>&1 && xsvc_own_pids) "
     for pn in $(pgrep -d' ' -f "${pat}" 2>/dev/null); do
         [[ "$own_pids" == *" $pn "* ]] && continue
         pname=$(ps -o comm= -p "$pn" 2>/dev/null | head -n1)
@@ -622,6 +627,226 @@ svc_restart() {
     fi
     sleep 1
     svc_active && ok "服务运行中" || warn "服务状态异常，请查看日志"
+}
+
+#------------------------- Xray 内核 (Reality 协议专用, v2ray-agent 同款) -------------------------
+# 内核路由: Reality 协议走 Xray, 其余走 sing-box
+proto_kernel() { case "$1" in vless-rv|vless-rg) echo xray ;; *) echo sing-box ;; esac; }
+kernel_active() { if [[ "$(proto_kernel "$1")" == "xray" ]]; then xsvc_active; else svc_active; fi; }
+
+xray_download_urls() {
+    local fname
+    case "$ARCH" in
+        amd64) fname="Xray-linux-64.zip" ;;
+        arm64) fname="Xray-linux-arm64-v8a.zip" ;;
+        *) return 1 ;;
+    esac
+    local u="https://github.com/XTLS/Xray-core/releases/latest/download/${fname}"
+    echo "$u"
+    echo "https://gh-proxy.com/${u}"
+    echo "https://ghfast.top/${u}"
+}
+
+install_xray() {
+    ensure_dirs
+    title "Xray 内核安装 (Reality 协议)"
+    [[ "$ARCH" == "unknown" ]] && die "不支持的 CPU 架构: $(uname -m)"
+    command -v unzip >/dev/null 2>&1 || { die "缺少 unzip 命令, 请先安装 (apt/yum/apk install unzip) 后重试。"; }
+    local tmp url okdl=0
+    tmp="$(mktemp -d)" || die "创建临时目录失败"
+    while IFS= read -r url; do
+        [[ -z "$url" ]] && continue
+        printf '%s    下载: %s%s\n' "$GRAY" "$url" "$NC"
+        if curl -fSL --connect-timeout 8 --max-time 300 -o "$tmp/xray.zip" "$url" 2>/dev/null && [[ -s "$tmp/xray.zip" ]]; then
+            okdl=1; break
+        fi
+        warn "该地址下载失败，切换备用地址..."
+    done < <(xray_download_urls)
+    [[ "$okdl" != "1" ]] && { rm -rf "$tmp"; die "Xray 下载失败(所有地址均不可达)。"; }
+    unzip -o "$tmp/xray.zip" xray -d "$tmp" >/dev/null 2>&1
+    [[ -f "$tmp/xray" ]] || { rm -rf "$tmp"; die "压缩包内未找到 xray 可执行文件"; }
+    install -m 0755 "$tmp/xray" "$XRAY_BIN"
+    if [[ -f "$tmp/geoip.dat" ]]; then
+        mkdir -p /usr/local/share/xray
+        install -m 0644 "$tmp/geoip.dat" /usr/local/share/xray/ 2>/dev/null
+        install -m 0644 "$tmp/geosite.dat" /usr/local/share/xray/ 2>/dev/null
+    fi
+    rm -rf "$tmp"
+    # 真正执行一次验证(musl 系统常见无法运行)
+    if ! "$XRAY_BIN" version >/dev/null 2>&1; then
+        err "Xray 已下载但无法运行(常见于 Alpine/musl 系统)。"
+        if command -v apk >/dev/null 2>&1; then
+            info "正在自动安装兼容层 gcompat ..."
+            apk add --no-cache gcompat libstdc++ >/dev/null 2>&1
+            "$XRAY_BIN" version >/dev/null 2>&1 || die "仍无法运行。请手动执行: apk add gcompat libstdc++ 后重试。"
+            ok "兼容层安装成功, Xray 可正常运行"
+        else
+            die "无法运行 $XRAY_BIN, 请检查系统兼容性。"
+        fi
+    fi
+    ok "Xray 安装完成: $("$XRAY_BIN" version 2>/dev/null | head -n1)"
+}
+
+ensure_xray_core() {
+    if [[ -x "$XRAY_BIN" ]] && "$XRAY_BIN" version >/dev/null 2>&1; then return 0; fi
+    install_xray
+}
+
+xray_ensure_service() {
+    if [[ "$INIT_SYS" == "openrc" ]] && [[ -x "/etc/init.d/${XRAY_SERVICE}" ]]; then return 0; fi
+    if [[ "$INIT_SYS" == "systemd" ]] && [[ -f "/etc/systemd/system/${XRAY_SERVICE}.service" ]]; then return 0; fi
+    if [[ "$INIT_SYS" == "openrc" ]]; then
+        cat > "/etc/init.d/${XRAY_SERVICE}" <<UNIT
+#!/sbin/openrc-run
+description="ProxyBox Xray (Reality) service"
+command="${XRAY_BIN}"
+command_args="run -config ${XRAY_CFG}"
+command_background="yes"
+pidfile="/run/${XRAY_SERVICE}.pid"
+output_log="${XRAY_LOG_FILE}"
+error_log="${XRAY_LOG_FILE}"
+depend() {
+    need net
+    use dns
+}
+UNIT
+        chmod +x "/etc/init.d/${XRAY_SERVICE}"
+    else
+        cat > "/etc/systemd/system/${XRAY_SERVICE}.service" <<UNIT
+[Unit]
+Description=ProxyBox Xray (Reality) service
+After=network.target nss-lookup.target
+
+[Service]
+Type=simple
+ExecStart=${XRAY_BIN} run -config ${XRAY_CFG}
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+        systemctl daemon-reload
+    fi
+    if [[ "$INIT_SYS" == "systemd" ]]; then
+        systemctl enable "$XRAY_SERVICE" >/dev/null 2>&1
+    else
+        rc-update add "$XRAY_SERVICE" default >/dev/null 2>&1
+    fi
+    ok "已创建并启用 Xray 服务: $XRAY_SERVICE"
+}
+
+xsvc_restart()  { if [[ "$INIT_SYS" == "systemd" ]]; then systemctl restart "$XRAY_SERVICE"; else rc-service "$XRAY_SERVICE" restart; fi; }
+xsvc_active()   { if [[ "$INIT_SYS" == "systemd" ]]; then systemctl is-active --quiet "$XRAY_SERVICE" 2>/dev/null; else rc-service "$XRAY_SERVICE" status >/dev/null 2>&1; fi; }
+xsvc_stop_now() { if [[ "$INIT_SYS" == "systemd" ]]; then systemctl disable --now "$XRAY_SERVICE" >/dev/null 2>&1; else rc-service "$XRAY_SERVICE" stop >/dev/null 2>&1; rc-update del "$XRAY_SERVICE" default >/dev/null 2>&1; fi; }
+xsvc_log_tail() { if [[ "$INIT_SYS" == "systemd" ]]; then journalctl -u "$XRAY_SERVICE" -n "${1:-60}" --no-pager -e 2>/dev/null; else tail -n "${1:-60}" "$XRAY_LOG_FILE" 2>/dev/null; fi; }
+xsvc_own_pids() { pgrep -f "xray run -config ${XRAY_CFG}" 2>/dev/null | tr '\n' ' '; }
+
+# Xray 配置自检(兼容新旧命令行形式)
+xray_test_config() {
+    local cfg="$1"
+    "$XRAY_BIN" run -test -config "$cfg" >/dev/null 2>&1 && return 0
+    "$XRAY_BIN" -test -config "$cfg" >/dev/null 2>&1
+}
+
+# 从 env 文件读单个字段(不污染全局状态): env_get <key> <FIELD>
+env_get() { grep -E "^$2=" "$SB_ENV_DIR/$1.env" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d "'\""; }
+
+# 生成单个 Xray Reality-Vision 入站 (模板与 v2ray-agent 07_VLESS_vision_reality 一致)
+xray_inbound_rv() {
+    cat <<EOF
+{
+  "listen": "0.0.0.0",
+  "port": $1,
+  "protocol": "vless",
+  "tag": "in-xray-rv-$1",
+  "settings": {
+    "clients": [ { "id": "$2", "flow": "xtls-rprx-vision" } ],
+    "decryption": "none"
+  },
+  "streamSettings": {
+    "network": "tcp",
+    "security": "reality",
+    "realitySettings": {
+      "show": false,
+      "target": "$3:$4",
+      "xver": 0,
+      "serverNames": [ "$3" ],
+      "privateKey": "$5",
+      "shortIds": [ "$6", "" ],
+      "maxTimeDiff": 70000
+    }
+  }
+}
+EOF
+}
+
+# 生成单个 Xray Reality-gRPC 入站
+xray_inbound_rg() {
+    cat <<EOF
+{
+  "listen": "0.0.0.0",
+  "port": $1,
+  "protocol": "vless",
+  "tag": "in-xray-rg-$1",
+  "settings": {
+    "clients": [ { "id": "$2" } ],
+    "decryption": "none"
+  },
+  "streamSettings": {
+    "network": "grpc",
+    "security": "reality",
+    "realitySettings": {
+      "show": false,
+      "target": "$3:$4",
+      "xver": 0,
+      "serverNames": [ "$3" ],
+      "privateKey": "$5",
+      "shortIds": [ "$6", "" ],
+      "maxTimeDiff": 70000
+    },
+    "grpcSettings": {
+      "serviceName": "$7",
+      "multiMode": true
+    }
+  }
+}
+EOF
+}
+
+# 重建 Xray 合并配置(读取所有已安装的 rv/rg 协议):
+# 返回 0=成功 1=校验失败 2=没有任何 Reality 协议
+xray_rebuild_config() {
+    local keys=() k frag all="" p u sh sp pk sid rpc rc
+    ensure_dirs
+    mapfile -t keys < <(installed_keys)
+    for k in "${keys[@]}"; do
+        case "$k" in vless-rv|vless-rg) ;; *) continue ;; esac
+        p="$(env_get "$k" PORT)"; u="$(env_get "$k" UUID)"
+        sh="$(env_get "$k" SNI_HOST)"; sp="$(env_get "$k" SNI_PORT)"
+        pk="$(env_get "$k" REALITY_PK)"; sid="$(env_get "$k" SHORT_ID)"
+        rpc="$(env_get "$k" RPC)"
+        [[ -z "$p" || -z "$u" || -z "$sh" || -z "$pk" ]] && { warn "跳过 $k: 参数文件不完整"; continue; }
+        sp="${sp:-443}"
+        if [[ "$k" == "vless-rv" ]]; then
+            frag="$(xray_inbound_rv "$p" "$u" "$sh" "$sp" "$pk" "$sid")"
+        else
+            frag="$(xray_inbound_rg "$p" "$u" "$sh" "$sp" "$pk" "$sid" "${rpc:-grpcTls}")"
+        fi
+        all+="${all:+,}$frag"
+    done
+    if [[ -z "$all" ]]; then return 2; fi
+    printf '{"log":{"loglevel":"warning"},"inbounds":[%s],"outbounds":[{"protocol":"freedom","tag":"direct"}]}' "$all" > "${XRAY_CFG}.tmp"
+    if ! xray_test_config "${XRAY_CFG}.tmp"; then
+        mv -f "${XRAY_CFG}.tmp" "${XRAY_CFG}.testfail" 2>/dev/null
+        err "Xray 配置校验失败, 内容已保留在 ${XRAY_CFG}.testfail"
+        return 1
+    fi
+    mv -f "${XRAY_CFG}.tmp" "$XRAY_CFG"
+    # 老版本残留: rv/rg 曾由 sing-box 承载, 迁移到 Xray 后移除其配置, 避免端口双占用
+    rm -f "$SB_CFG_DIR/vless-rv.json" "$SB_CFG_DIR/vless-rg.json"
+    return 0
 }
 
 #--------------------------------- 配置/env 管理 ----------------------------------
@@ -1449,7 +1674,7 @@ verify_installed() {
     local k="$1" port scheme i
     port="$(grep -E '^PORT=' "$SB_ENV_DIR/$k.env" 2>/dev/null | head -n1 | cut -d= -f2 | tr -d "'\"")"
     [[ -z "$port" ]] && return 0
-    if ! svc_active; then
+    if ! kernel_active "$k"; then
         warn "安装后验证: 服务未运行! 请到『代理管理→查看运行日志』排查。"
         return 1
     fi
@@ -1468,20 +1693,47 @@ verify_installed() {
 }
 
 apply_one() {
-    local k="$1"
+    local k="$1" rc
     ensure_dirs
     if [[ ! -f "$SB_ENV_DIR/$k.env" ]]; then
         err "未找到 $k 参数文件: $SB_ENV_DIR/$k.env"
         return 1
     fi
-    ensure_service
-    if ! gen_config "$k"; then
-        err "$k 配置校验失败，已回滚备份"
-        return 1
-    fi
-    if ! svc_restart; then
-        err "服务重启失败，请尝试『代理管理』中的查看日志"
-        return 1
+    if [[ "$(proto_kernel "$k")" == "xray" ]]; then
+        # ---- Reality 协议: Xray 内核 (v2ray-agent 同款) ----
+        ensure_xray_core || return 1
+        ensure_service            # sing-box 仍承载其他协议
+        xray_ensure_service
+        xray_rebuild_config; rc=$?
+        if [[ "$rc" == "2" ]]; then
+            warn "没有任何 Reality 协议了, 停止 Xray 服务"
+            xsvc_stop_now; rm -f "$XRAY_CFG"
+            return 0
+        fi
+        if [[ "$rc" != "0" ]]; then
+            err "Xray 配置生成/校验失败"
+            return 1
+        fi
+        # sing-box 若还挂着旧 Reality 入站(老版本迁移), 先释放端口
+        if svc_active && [[ -f "$SB_CFG_DIR/vless-rv.json" || -f "$SB_CFG_DIR/vless-rg.json" ]]; then
+            svc_do_restart >/dev/null 2>&1 || true
+        fi
+        if ! xsvc_restart; then
+            err "Xray 服务重启失败, 最近日志如下:"
+            xsvc_log_tail 20 | sed 's/^/    /'
+            return 1
+        fi
+        sleep 1
+    else
+        ensure_service
+        if ! gen_config "$k"; then
+            err "$k 配置校验失败，已回滚备份"
+            return 1
+        fi
+        if ! svc_restart; then
+            err "服务重启失败，请尝试『代理管理』中的查看日志"
+            return 1
+        fi
     fi
     verify_installed "$k"
     return 0
@@ -1516,6 +1768,9 @@ menu_list() {
     done
     hr
     info "sing-box 状态: $(svc_active && echo 运行中 || echo 未运行)   版本: $("$SB_BIN" version 2>/dev/null | head -n1 || echo 未知)"
+    if [[ -x "$XRAY_BIN" ]]; then
+        info "Xray(Reality) 状态: $(xsvc_active && echo 运行中 || echo 未运行)   版本: $("$XRAY_BIN" version 2>/dev/null | head -n1 | awk '{print $2}' || echo 未知)"
+    fi
     return 0
 }
 
@@ -1793,6 +2048,18 @@ menu_delete() {
     fi
     rm -f "$SB_CFG_DIR/$k.json" "$SB_ENV_DIR/$k.env" "$SB_BAK_DIR/$k.json.bak"
     ok "已删除 $k"
+    # Xray 承载的协议: 删除后重建合并配置并重启; 若无 Reality 协议了则停掉 Xray
+    if [[ "$(proto_kernel "$k")" == "xray" ]]; then
+        xray_rebuild_config; rc=$?
+        if [[ "$rc" == "2" ]]; then
+            xsvc_stop_now; rm -f "$XRAY_CFG"
+            ok "已停止 Xray 服务(没有 Reality 协议了)"
+        elif [[ "$rc" == "0" ]]; then
+            xsvc_restart && ok "Xray 配置已重建并重启"
+        else
+            err "Xray 配置重建失败, 请查看上方提示"
+        fi
+    fi
     # 若已无任何协议, 询问是否连服务/内核一起卸载
     if [[ -z "$(installed_keys)" ]]; then
         ask_choice "已无任何代理配置, 是否继续清理?" 1 \
@@ -1819,7 +2086,7 @@ menu_service() {
     case "$RESULT" in
         1) svc_do_start && ok "已启动" ;;
         2) svc_do_stop && ok "已停止" ;;
-        3) svc_restart ;;
+        3) svc_restart; if [[ -f "$XRAY_CFG" ]]; then info "重启 Xray(Reality) 服务..."; xray_ensure_service; xsvc_restart; fi ;;
         4) svc_show_status ;;
     esac
     pause
@@ -1827,11 +2094,17 @@ menu_service() {
 
 menu_logs() {
     title "查看日志(最近 60 行)"
-    svc_log_tail 60 | sed 's/^/  /'
+    info "--- sing-box (SS2022/Hy2/TUIC) ---"
+    svc_log_tail 40 | sed 's/^/  /'
+    if [[ -x "$XRAY_BIN" ]]; then
+        info "--- Xray (Reality) ---"
+        xsvc_log_tail 40 | sed 's/^/  /'
+        info "Xray 日志文件: $XRAY_LOG_FILE"
+    fi
     if [[ "$INIT_SYS" == "systemd" ]]; then
-        info "持续跟踪: journalctl -u $SERVICE_NAME -f"
+        info "持续跟踪: journalctl -u $SERVICE_NAME -f ; journalctl -u $XRAY_SERVICE -f"
     else
-        info "持续跟踪: tail -f $LOG_FILE"
+        info "持续跟踪: tail -f $LOG_FILE ; tail -f $XRAY_LOG_FILE"
     fi
     pause
 }
@@ -1847,7 +2120,16 @@ uninstall_core() {
         rm -f "/etc/init.d/${SERVICE_NAME}"
     fi
     rm -f "$SB_BIN" "$LOG_FILE" "/run/${SERVICE_NAME}.pid"
-    ok "sing-box 内核与服务已卸载"
+    # Xray 内核一并卸载
+    xsvc_stop_now
+    if [[ "$INIT_SYS" == "systemd" && -f "/etc/systemd/system/${XRAY_SERVICE}.service" ]]; then
+        rm -f "/etc/systemd/system/${XRAY_SERVICE}.service"; systemctl daemon-reload
+    elif [[ "$INIT_SYS" == "openrc" && -x "/etc/init.d/${XRAY_SERVICE}" ]]; then
+        rm -f "/etc/init.d/${XRAY_SERVICE}"
+    fi
+    rm -f "$XRAY_BIN" "$XRAY_CFG" "$XRAY_LOG_FILE" "/run/${XRAY_SERVICE}.pid"
+    rm -rf /usr/local/share/xray
+    ok "sing-box 与 Xray 内核、服务均已卸载"
 }
 
 uninstall_all() {
@@ -2030,7 +2312,7 @@ menu_install() {
         title "安装代理"
         printf '  %s1)%s '   "$BOLD" "$NC"; mark_installed "ss2022";   echo "Shadowsocks-2022     TCP, 抗重放强化"
         printf '  %s2)%s '   "$BOLD" "$NC"; mark_installed "hy2";      echo "Hysteria2            UDP/QUIC, 弱网提速"
-        printf '  %s3)%s '   "$BOLD" "$NC"; mark_installed "vless-rv"; echo "VLESS-Reality-Vision TCP, 无域名偷站伪装 ★推荐·抗封锁最强"
+        printf '  %s3)%s '   "$BOLD" "$NC"; mark_installed "vless-rv"; echo "VLESS-Reality-Vision TCP, 无域名偷站伪装 ★推荐·Xray内核·抗封锁最强"
         printf '  %s4)%s '   "$BOLD" "$NC"; mark_installed "vless-rg"; echo "VLESS-Reality-gRPC   TCP, 伪装+grpc传输"
         printf '  %s5)%s '   "$BOLD" "$NC"; mark_installed "vless-ts"; echo "VLESS-Vision-TLS     TCP, 带域名+自签证书 △仅作临时备用·易被探测封锁"
         printf '  %s6)%s '   "$BOLD" "$NC"; mark_installed "tuic";     echo "TUIC v5              UDP/QUIC, 0-RTT 低延迟"
