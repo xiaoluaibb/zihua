@@ -15,7 +15,7 @@
 #===============================================================================
 
 #--------------------------------- 全局变量 ------------------------------------
-PROXYBOX_VERSION="1.4.8"
+PROXYBOX_VERSION="1.4.9"
 SB_BIN="/usr/local/bin/sing-box"
 SB_DIR="/etc/sing-box"
 SB_ENV_DIR="$SB_DIR/instance.d"          # 每个协议一份参数(env)
@@ -2223,6 +2223,27 @@ open_port_in_firewall() {
 # 读值并兜底显示(容器内部分键不可读)
 _v() { local x; x="$(sysctl_cur "$1")"; printf '%s' "${x:--}"; }
 
+# 该键是否被容器/宿主完全隐藏(/proc 里没有, sysctl 也读不到)
+sysctl_hidden() {
+    [[ -e "/proc/sys/${1//./\/}" ]] && return 1
+    [[ -n "$(sysctl -n "$1" 2>/dev/null)" ]] && return 1
+    return 0
+}
+
+# 队列调度器状态: 内核不暴露 net.core.default_qdisc 时, 退而查询网卡实际 qdisc
+qdisc_state() {
+    local q iface d
+    q="$(sysctl_cur net.core.default_qdisc)"
+    if [[ -n "$q" ]]; then printf '%s' "$q"; return 0; fi
+    iface="$(ip route show default 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n 1)"
+    [[ -z "$iface" ]] && iface="$(ls /sys/class/net 2>/dev/null | grep -v '^lo$' | head -n 1)"
+    if command -v tc >/dev/null 2>&1 && [[ -n "$iface" ]]; then
+        d="$(tc qdisc show dev "$iface" 2>/dev/null | head -n 1 | awk '{print $2}')"
+        [[ -n "$d" ]] && { printf '不可读(%s 实际 %s)' "$iface" "$d"; return 0; }
+    fi
+    printf '不可读(容器由宿主机控制)'
+}
+
 show_net_status() {
     title "当前网络内核参数状态"
     local cc qdisc avail kern mem buf
@@ -2236,10 +2257,10 @@ show_net_status() {
         warn "内核版本低于 4.9，无法开启 BBR。建议升级系统(如 Debian 12 / Ubuntu 22.04)。"
     fi
     cc="$(sysctl_cur net.ipv4.tcp_congestion_control)"
-    qdisc="$(sysctl_cur net.core.default_qdisc)"
+    qdisc="$(qdisc_state)"
     avail="$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null | tr ' ' '/' )"
     printf '  拥塞控制算法: %s%s%s   (可选: %s)\n' "$BOLD" "${cc:-不可读}" "$NC" "${avail:-未知}"
-    printf '  默认队列算法: %s%s%s\n' "$BOLD" "${qdisc:-不可读(容器受限)}" "$NC"
+    printf '  默认队列算法: %s%s%s\n' "$BOLD" "${qdisc:-不可读}" "$NC"
     printf '  收发缓冲上限: rmem=%s  wmem=%s   (本机建议: %s)\n' \
         "$(_v net.core.rmem_max)" "$(_v net.core.wmem_max)" "$buf"
     printf '  并发队列    : somaxconn=%s  backlog=%s  SYN=%s\n' \
@@ -2364,7 +2385,8 @@ apply_sysctl_table() {
     while IFS='|' read -r key val scope desc; do
         [[ -z "$key" || "$key" == \#* ]] && continue
         if ! sysctl_ok "$key"; then
-            TUNE_SKIP+="$key "
+            # 区分: 内核根本没有该键(容器未暴露) / 容器不可见但宿主有
+            if sysctl_hidden "$key"; then TUNE_SKIP+="$key "; else TUNE_HOST+="$key "; fi
             continue
         fi
         sysctl_backup "$key" "$(sysctl_cur "$key")"
@@ -2391,9 +2413,14 @@ _tune_list_warn() {
 
 report_tune_result() {
     ok "本次生效 ${TUNE_OK} 项"
-    _tune_list_warn "当前内核无此参数, 已跳过" "$TUNE_SKIP"
+    _tune_list_warn "该内核/容器未暴露此参数, 已跳过" "$TUNE_SKIP"
     _tune_list_warn "宿主级参数不可写(容器/权限限制, 不影响代理)" "$TUNE_HOST"
     _tune_list_warn "写入被拒" "$TUNE_FAIL"
+    # 容器内改不了队列调度时给出准确解释, 避免误以为 BBR 没生效
+    if [[ "$TUNE_SKIP$TUNE_HOST" == *net.core.default_qdisc* ]]; then
+        info "net.core.default_qdisc 由宿主机管理, 容器内改不了; 属正常现象。"
+        info "Linux 4.20 起 BBR 自带 pacing, 缺 fq 不影响加速效果; 网卡实际队列见上方状态行。"
+    fi
     return 0
 }
 
@@ -2458,7 +2485,7 @@ enable_bbr_only() {
     ensure_sysctl_boot
     report_tune_result
     printf '  当前设置: tcp_congestion_control=%s  default_qdisc=%s\n' \
-        "$(sysctl_cur net.ipv4.tcp_congestion_control)" "$(sysctl_cur net.core.default_qdisc)"
+        "$(_v net.ipv4.tcp_congestion_control)" "$(qdisc_state)"
     if [[ "$(sysctl_cur net.ipv4.tcp_congestion_control)" == "bbr" ]]; then
         ok "BBR 已启用"
     else
@@ -2485,7 +2512,7 @@ net_optimize_full() {
     write_tune_file "$(tune_table_full)" "一键优化 (BBR + 全量网络参数)"
     report_tune_result
     printf '  拥塞控制: %s   队列: %s\n' \
-        "$(sysctl_cur net.ipv4.tcp_congestion_control)" "$(sysctl_cur net.core.default_qdisc)"
+        "$(_v net.ipv4.tcp_congestion_control)" "$(qdisc_state)"
     printf '  缓冲上限: rmem=%s  wmem=%s\n' \
         "$(sysctl_cur net.core.rmem_max)" "$(sysctl_cur net.core.wmem_max)"
     info "调优文件: $SYSCTL_FILE (重启自动生效)"
@@ -2516,7 +2543,7 @@ net_restore() {
         info "未找到调优前的原值记录, 已切回 cubic + pfifo_fast(其余参数重启后恢复默认)。"
     fi
     printf '  拥塞控制: %s   队列: %s\n' \
-        "$(sysctl_cur net.ipv4.tcp_congestion_control)" "$(sysctl_cur net.core.default_qdisc)"
+        "$(_v net.ipv4.tcp_congestion_control)" "$(qdisc_state)"
     ok "已恢复默认参数"
     return 0
 }
