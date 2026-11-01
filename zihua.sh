@@ -2123,6 +2123,112 @@ EOF
     bash "$rf" || true
 }
 
+#--------------------------------- 脚本自更新 -------------------------------------
+SELF_REPO_RAW="https://raw.githubusercontent.com/xiaoluaibb/zihua/main/zihua.sh"
+
+# 版本比较: $1 > $2 时返回 0 (纯数字段逐位比较, 兼容无 sort -V 的 BusyBox)
+ver_gt() {
+    local IFS=.
+    local a=(${1#v}) b=(${2#v}) i
+    for i in 0 1 2 3; do
+        [[ ${a[i]:-0} -gt ${b[i]:-0} ]] && return 0
+        [[ ${a[i]:-0} -lt ${b[i]:-0} ]] && return 1
+    done
+    return 1
+}
+
+# 下载最新脚本到 $1 (多通道: raw → gh-proxy → ghfast), 成功返回 0
+download_latest_script() {
+    local out="$1" u okdl=0
+    [[ "$(command -v curl || true)" == "" ]] && return 1
+    while IFS= read -r u; do
+        [[ -z "$u" ]] && continue
+        if curl -fsSL --connect-timeout 6 --max-time 60 -o "$out" "$u" 2>/dev/null \
+           && [[ -s "$out" ]] && head -n5 "$out" | grep -q "zihua.sh\|PROXYBOX_VERSION"; then
+            okdl=1; break
+        fi
+    done <<EOF
+$SELF_REPO_RAW
+https://gh-proxy.com/$SELF_REPO_RAW
+https://ghfast.top/$SELF_REPO_RAW
+EOF
+    [[ "$okdl" == "1" ]] || { rm -f "$out"; return 1; }
+    # 下载内容必须语法合法且带版本号, 防止镜像返回错误页
+    bash -n "$out" 2>/dev/null || { rm -f "$out"; return 1; }
+    grep -q 'PROXYBOX_VERSION="[0-9]' "$out" || { rm -f "$out"; return 1; }
+    return 0
+}
+
+# 获取远端最新版本号: 成功回显版本, 失败回显空
+fetch_remote_version() {
+    local tmp="$SB_BAK_DIR/.latest.sh"
+    mkdir -p "$SB_BAK_DIR" 2>/dev/null
+    download_latest_script "$tmp" || { rm -f "$tmp"; return 1; }
+    grep -m1 'PROXYBOX_VERSION=' "$tmp" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+'
+}
+
+# 执行更新: 替换当前脚本与 zihua 快捷命令 (旧版自动备份)
+do_self_update() {
+    local remote_ver="$1" tmp backup dest="/usr/local/bin/zihua" self
+    tmp="$SB_BAK_DIR/.latest.sh"
+    backup="/root/zihua.sh.bak-$(date +%Y%m%d%H%M%S)"
+    self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+    info "备份当前版本到 $backup ..."
+    cp -f "$self" "$backup" 2>/dev/null || warn "备份失败(继续更新)"
+    if [[ "$self" != "$dest" ]]; then
+        install -m 700 "$tmp" "$dest" 2>/dev/null || warn "更新快捷命令 $dest 失败"
+    fi
+    install -m 700 "$tmp" "$self" 2>/dev/null || { err "替换脚本失败(旧版已保留在 $backup)"; return 1; }
+    ok "已更新到 v$remote_ver (旧版备份: $backup)"
+    ask "立即重启脚本使用新版本? [Y/n]" "y"
+    if [[ "$RESULT" =~ ^[yY]([eE][sS])?$ ]]; then
+        exec bash "$self"
+    else
+        info "下次运行 zihua 时即为新版本。"
+    fi
+}
+
+# 启动时静默检测(不阻塞, 失败不打扰): 有新版才询问
+startup_update_check() {
+    [[ "${ZIHUA_NO_UPDATE_CHECK:-0}" == "1" ]] && return 0
+    command -v curl >/dev/null 2>&1 || return 0
+    local rv
+    rv="$(fetch_remote_version)" || return 0
+    [[ -z "$rv" ]] && return 0
+    if ver_gt "$rv" "$PROXYBOX_VERSION"; then
+        hr
+        warn "发现新版本: v$PROXYBOX_VERSION → v$rv"
+        ask "是否立即更新? [Y/n]" "y"
+        if [[ "$RESULT" =~ ^[yY]([eE][sS])?$ ]]; then
+            do_self_update "$rv"
+        else
+            info "已跳过, 可稍后在主菜单『6) 检查更新』手动更新。"
+        fi
+    fi
+    return 0
+}
+
+# 手动检查更新菜单
+menu_update() {
+    title "检查更新"
+    info "当前版本: v$PROXYBOX_VERSION"
+    info "正在检测远端最新版本(raw → gh-proxy → ghfast 多通道)..."
+    local rv
+    if ! rv="$(fetch_remote_version)" || [[ -z "$rv" ]]; then
+        err "检测失败: 无法连接 GitHub(所有通道均超时)。请检查服务器网络后重试。"
+        pause; return
+    fi
+    info "远端版本: v$rv"
+    if ver_gt "$rv" "$PROXYBOX_VERSION"; then
+        warn "有可用更新: v$PROXYBOX_VERSION → v$rv"
+        ask "是否立即更新? [Y/n]" "y"
+        [[ "$RESULT" =~ ^[yY]([eE][sS])?$ ]] && do_self_update "$rv"
+    else
+        ok "当前已是最新版本 v$PROXYBOX_VERSION"
+    fi
+    pause
+}
+
 #--------------------------------- 封面/主菜单 -------------------------------------
 banner() {
     clear 2>/dev/null || true
@@ -2155,6 +2261,7 @@ main_menu() {
         echo "  ${BOLD}3)${NC} 网络优化 (BBR / 内核调优)"
         echo "  ${BOLD}4)${NC} 系统与依赖体检"
         echo "  ${BOLD}5)${NC} 重装系统 (调用 reinstall-vm.sh, 危险!)"
+        echo "  ${BOLD}6)${NC} 检查更新 (当前 v${PROXYBOX_VERSION})"
         echo "  ${BOLD}0)${NC} 退出"
         hr
         ask "请选择" "1"
@@ -2164,6 +2271,7 @@ main_menu() {
             3) menu_network ;;
             4) show_system_info; ensure_deps; pause ;;
             5) menu_reinstall ;;
+            6) menu_update ;;
             0) ok "再见!"; exit 0 ;;
             *) err "请输入正确编号" ;;
         esac
@@ -2200,6 +2308,7 @@ main() {
     ensure_deps || true
     get_public_ip >/dev/null 2>&1 || true
     install_zihua_cmd
+    startup_update_check
     main_menu
 }
 
