@@ -15,7 +15,7 @@
 #===============================================================================
 
 #--------------------------------- 全局变量 ------------------------------------
-PROXYBOX_VERSION="1.4.1"
+PROXYBOX_VERSION="1.4.2"
 SB_BIN="/usr/local/bin/sing-box"
 SB_DIR="/etc/sing-box"
 SB_ENV_DIR="$SB_DIR/instance.d"          # 每个协议一份参数(env)
@@ -291,7 +291,8 @@ show_system_info() {
 # 返回占用该端口的进程信息(可能为空)
 port_busy_info() {
     local p="$1"
-    ss -H -lntup 2>/dev/null | grep "[:.]${p}[[:space:]]" | awk '{print $5, $6, $7}' | sort -u | sed 's/users:((.*//' | head -n 3
+    # ss -lntup 列: 状态 收队列 发队列 本地地址:端口 远端 进程; 本地在第4列、进程在第6列
+    ss -H -lntup 2>/dev/null | grep "[:.]${p}[[:space:]]" | awk '{print $4, $6}' | sort -u | sed 's/users:((.*//' | head -n 3
 }
 
 # 本机端口占用检测: port_in_use <端口> [tcp|udp|any]
@@ -303,7 +304,8 @@ port_in_use() {
         *)   flags="-lntu" ;;
     esac
     if command -v ss >/dev/null 2>&1; then
-        ss -H $flags 2>/dev/null | awk '{print $5}' | grep -qE "[:.]${p}\$"
+        # 直接对整行匹配「:端口+空白」: 只监听态下本地列才带端口, 远端列恒为 0.0.0.0:* / [::]:* 不会误中
+        ss -H $flags 2>/dev/null | grep -qE "[:.]${p}[[:space:]]"
     elif command -v netstat >/dev/null 2>&1; then
         netstat -ln${proto:0:1} 2>/dev/null | grep -qE "[:.]${p}[[:space:]]"
     else
