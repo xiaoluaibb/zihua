@@ -15,7 +15,7 @@
 #===============================================================================
 
 #--------------------------------- 全局变量 ------------------------------------
-PROXYBOX_VERSION="1.4.2"
+PROXYBOX_VERSION="1.4.3"
 SB_BIN="/usr/local/bin/sing-box"
 SB_DIR="/etc/sing-box"
 SB_ENV_DIR="$SB_DIR/instance.d"          # 每个协议一份参数(env)
@@ -1195,15 +1195,15 @@ link_tuic() {
 }
 
 link_vless_rv() {
-    echo "vless://${UUID}@${IP}:${PORT}?type=tcp&security=reality&flow=xtls-rprx-vision&sni=${SNI_HOST}&fp=chrome&pbk=${REALITY_PUB}&sid=${SHORT_ID}#${NODE_NAME}"
+    echo "vless://${UUID}@${IP}:${PORT}?encryption=none&type=tcp&security=reality&flow=xtls-rprx-vision&sni=${SNI_HOST}&fp=chrome&pbk=${REALITY_PUB}&sid=${SHORT_ID}#${NODE_NAME}"
 }
 
 link_vless_rg() {
-    echo "vless://${UUID}@${IP}:${PORT}?type=grpc&security=reality&serviceName=${RPC}&sni=${SNI_HOST}&fp=chrome&pbk=${REALITY_PUB}&sid=${SHORT_ID}#${NODE_NAME}"
+    echo "vless://${UUID}@${IP}:${PORT}?encryption=none&type=grpc&security=reality&serviceName=${RPC}&sni=${SNI_HOST}&fp=chrome&pbk=${REALITY_PUB}&sid=${SHORT_ID}#${NODE_NAME}"
 }
 
 link_vless_ts() {
-    echo "vless://${UUID}@${IP}:${PORT}?type=tcp&security=tls&flow=xtls-rprx-vision&sni=${DOMAIN}&fp=chrome&allowInsecure=1#${NODE_NAME}"
+    echo "vless://${UUID}@${IP}:${PORT}?encryption=none&type=tcp&security=tls&flow=xtls-rprx-vision&sni=${DOMAIN}&fp=chrome&allowInsecure=1#${NODE_NAME}"
 }
 
 # 打印某协议的分享信息: print_share <key>
