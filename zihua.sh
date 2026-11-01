@@ -1773,8 +1773,8 @@ menu_delete() {
     local k="$PICKED"
     load_env "$k"
     warn "即将删除协议 ${k} 的配置(端口 ${PORT}, 名称 ${NAME})"
-    ask "确认删除? 输入 yes 确认" "no"
-    if [[ "$RESULT" != "yes" ]]; then
+    ask "确认删除? [y/N]" "n"
+    if ! [[ "$RESULT" =~ ^[yY]([eE][sS])?$ ]]; then
         info "已取消删除"; pause; return
     fi
     rm -f "$SB_CFG_DIR/$k.json" "$SB_ENV_DIR/$k.env" "$SB_BAK_DIR/$k.json.bak"
@@ -1838,8 +1838,8 @@ uninstall_core() {
 
 uninstall_all() {
     warn "该操作将删除: systemd 服务、sing-box 程序、/etc/sing-box 下全部配置与证书, 且不可恢复！"
-    ask "请输入 uninstall 确认彻底卸载" "no"
-    [[ "$RESULT" != "uninstall" ]] && { info "已取消"; return 1; }
+    ask "确认彻底卸载? [y/N]" "n"
+    [[ ! "$RESULT" =~ ^[yY]([eE][sS])?$ ]] && { info "已取消"; return 1; }
     uninstall_core
     rm -rf "$SB_DIR"
     ok "已彻底清除 ProxyBox 相关数据"
@@ -2016,11 +2016,12 @@ menu_install() {
         title "安装代理"
         printf '  %s1)%s '   "$BOLD" "$NC"; mark_installed "ss2022";   echo "Shadowsocks-2022     TCP, 抗重放强化"
         printf '  %s2)%s '   "$BOLD" "$NC"; mark_installed "hy2";      echo "Hysteria2            UDP/QUIC, 弱网提速"
-        printf '  %s3)%s '   "$BOLD" "$NC"; mark_installed "vless-rv"; echo "VLESS-Reality-Vision TCP, 无域名偷站伪装(推荐443)"
+        printf '  %s3)%s '   "$BOLD" "$NC"; mark_installed "vless-rv"; echo "VLESS-Reality-Vision TCP, 无域名偷站伪装 ★推荐·抗封锁最强"
         printf '  %s4)%s '   "$BOLD" "$NC"; mark_installed "vless-rg"; echo "VLESS-Reality-gRPC   TCP, 伪装+grpc传输"
-        printf '  %s5)%s '   "$BOLD" "$NC"; mark_installed "vless-ts"; echo "VLESS-Vision-TLS     TCP, 带域名+自签证书(兼容性最好)"
+        printf '  %s5)%s '   "$BOLD" "$NC"; mark_installed "vless-ts"; echo "VLESS-Vision-TLS     TCP, 带域名+自签证书 △仅作临时备用·易被探测封锁"
         printf '  %s6)%s '   "$BOLD" "$NC"; mark_installed "tuic";     echo "TUIC v5              UDP/QUIC, 0-RTT 低延迟"
         echo "  ${BOLD}0)${NC} 返回上级"
+        info "推荐: 日常首选 3) Reality-Vision(主动探测免疫); 5) 自签证书易被 GFW 识别封 IP, 仅在客户端不兼容 Reality 时临时使用。"
         info "提示: 多个协议可同时运行互不影响; 端口规则: 同为 TCP 或同为 UDP 不可重复, TCP 与 UDP 可同号(如 Vision 用 TCP 443, Hysteria2 用 UDP 443)。"
         ask "请选择" "0"
         local key=""
@@ -2097,8 +2098,8 @@ menu_reinstall() {
     warn "重装会清空本机全部数据(代理配置/网站/数据库/本脚本都会消失)，过程不可中断！"
     warn "执行前请确认: ①本机没有需要保留的数据 ②知道服务商 VNC/控制台入口 ③记录好重装时设置的 root 密码。"
     info "重装由同仓库的 reinstall-vm.sh 完成: KVM 走 netboot+preseed 全自动安装, LXC/容器走 rootfs 原位替换。"
-    ask "确认继续? 输入 yes 进入重装菜单" "no"
-    [[ "$RESULT" != "yes" ]] && { info "已取消"; return; }
+    ask "确认继续? [y/N]" "n"
+    [[ ! "$RESULT" =~ ^[yY]([eE][sS])?$ ]] && { info "已取消"; return; }
     local rf="/usr/local/bin/reinstall-vm.sh" okdl=0 u base
     if [[ ! -f "$rf" ]]; then
         info "下载重装脚本 reinstall-vm.sh ..."
