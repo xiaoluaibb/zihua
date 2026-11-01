@@ -15,7 +15,7 @@
 #===============================================================================
 
 #--------------------------------- 全局变量 ------------------------------------
-PROXYBOX_VERSION="1.4.7"
+PROXYBOX_VERSION="1.4.8"
 SB_BIN="/usr/local/bin/sing-box"
 SB_DIR="/etc/sing-box"
 SB_ENV_DIR="$SB_DIR/instance.d"          # 每个协议一份参数(env)
@@ -33,6 +33,7 @@ XRAY_LOG_FILE="/var/log/zihua-xray.log"
 XRAY_PIN_VER="v26.6.27"
 UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 SYSCTL_FILE="/etc/sysctl.d/99-proxybox-optimize.conf"
+SYSCTL_BAK="/etc/sysctl.d/proxybox-optimize.orig"   # 调优前原值备份(无 .conf 后缀, 不会被 sysctl 加载)
 PUB_IP=""
 INIT_SYS=""                                # systemd / openrc / none
 LOG_FILE="/var/log/sing-box-proxy.log"     # OpenRC 模式下的日志文件
@@ -2219,51 +2220,208 @@ open_port_in_firewall() {
 }
 
 #--------------------------------- 网络优化 (BBR/内核调优) -------------------------
+# 读值并兜底显示(容器内部分键不可读)
+_v() { local x; x="$(sysctl_cur "$1")"; printf '%s' "${x:--}"; }
+
 show_net_status() {
     title "当前网络内核参数状态"
-    local cc qdisc avail kern
+    local cc qdisc avail kern mem buf
     kern="$KERNEL"
-    info "内核版本: ${kern}"
+    mem="$(mem_total_mb)"
+    buf="$(tune_buf_bytes "$mem")"
+    info "内核版本: ${kern}   内存: ${mem} MB"
     if version_ge "${kern%%-*}" "4.9"; then
         ok "内核版本满足 BBR 要求 (≥ 4.9)"
     else
         warn "内核版本低于 4.9，无法开启 BBR。建议升级系统(如 Debian 12 / Ubuntu 22.04)。"
     fi
-    cc="$([[ -r /proc/sys/net/ipv4/tcp_congestion_control ]] && cat /proc/sys/net/ipv4/tcp_congestion_control)"
-    qdisc="$([[ -r /proc/sys/net/core/default_qdisc ]] && cat /proc/sys/net/core/default_qdisc)"
-    avail="$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null | tr ' ' '\n' | tr '\n' ' ')"
-    printf '  拥塞控制算法: %s%s%s   (可选: %s)\n' "$BOLD" "${cc:-未知}" "$NC" "${avail:-未知}"
-    printf '  默认队列算法: %s%s%s\n' "$BOLD" "${qdisc:-未知}" "$NC"
+    cc="$(sysctl_cur net.ipv4.tcp_congestion_control)"
+    qdisc="$(sysctl_cur net.core.default_qdisc)"
+    avail="$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null | tr ' ' '/' )"
+    printf '  拥塞控制算法: %s%s%s   (可选: %s)\n' "$BOLD" "${cc:-不可读}" "$NC" "${avail:-未知}"
+    printf '  默认队列算法: %s%s%s\n' "$BOLD" "${qdisc:-不可读(容器受限)}" "$NC"
+    printf '  收发缓冲上限: rmem=%s  wmem=%s   (本机建议: %s)\n' \
+        "$(_v net.core.rmem_max)" "$(_v net.core.wmem_max)" "$buf"
+    printf '  并发队列    : somaxconn=%s  backlog=%s  SYN=%s\n' \
+        "$(_v net.core.somaxconn)" "$(_v net.core.netdev_max_backlog)" "$(_v net.ipv4.tcp_max_syn_backlog)"
+    printf '  加速项      : fastopen=%s  空闲不重置窗口=%s  MTU探测=%s  TIME_WAIT复用=%s\n' \
+        "$(_v net.ipv4.tcp_fastopen)" "$(_v net.ipv4.tcp_slow_start_after_idle)" \
+        "$(_v net.ipv4.tcp_mtu_probing)" "$(_v net.ipv4.tcp_tw_reuse)"
     if [[ "${cc:-}" == "bbr" ]]; then
         ok "BBR 已启用"
     else
-        info "BBR 未启用"
+        warn "BBR 未启用 (选 1 或 2 开启)"
+    fi
+    if [[ -f "$SYSCTL_FILE" ]]; then
+        info "调优配置文件: $SYSCTL_FILE ($(grep -c ' = ' "$SYSCTL_FILE" 2>/dev/null || echo 0) 项, 重启自动生效)"
+    else
+        info "调优配置文件: 未创建"
     fi
     return 0
 }
 
-write_tune_file() {
-    mkdir -p /etc/sysctl.d
-    cat > "$SYSCTL_FILE" <<EOF
-# ProxyBox 内核参数调优 (删除本文件或运行本脚本『恢复默认』可还原)
-fs.file-max = 1048576
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_notsent_lowat = 16384
-net.core.rmem_max = 67108864
-net.core.wmem_max = 67108864
-net.core.rmem_default = 1048576
-net.core.wmem_default = 1048576
-net.ipv4.tcp_rmem = 4096 87380 33554432
-net.ipv4.tcp_wmem = 4096 16384 33554432
-net.core.netdev_max_backlog = 16384
-net.ipv4.udp_mem = 378888 505184 1577776
-net.ipv4.conf.all.route_localnet = 1
-vm.swappiness = 10
+# --- 内核调优基础工具 ---
+# 物理内存(MB)
+mem_total_mb() {
+    local kb
+    kb="$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null)"
+    [[ -z "$kb" || "$kb" -le 0 ]] && kb=1048576
+    echo $(( kb / 1024 ))
+}
+
+# 收发缓冲上限: 按物理内存缩放(照抄大盘鸡脚本的 64M/128M 会让小内存机型 OOM)
+tune_buf_bytes() {
+    local mb="${1:-1024}"
+    if   (( mb <= 384 ));  then echo 8388608      # 8M
+    elif (( mb <= 768 ));  then echo 16777216     # 16M
+    elif (( mb <= 1536 )); then echo 33554432     # 32M
+    elif (( mb <= 3072 )); then echo 50331648     # 48M
+    elif (( mb <= 6144 )); then echo 67108864     # 64M
+    else                       echo 134217728     # 128M
+    fi
+}
+
+# sysctl 键在当前内核/命名空间是否存在(容器与老内核常有缺项, 直接写会整批报错)
+sysctl_ok() { [[ -e "/proc/sys/${1//./\/}" ]]; }
+
+# 读取 sysctl 当前值
+sysctl_cur() {
+    local p="/proc/sys/${1//./\/}"
+    if [[ -r "$p" ]]; then
+        tr -s '[:space:]' ' ' < "$p" 2>/dev/null | sed 's/^ //; s/ $//'
+    else
+        sysctl -n "$1" 2>/dev/null | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//'
+    fi
+}
+
+# 首次调优时记录原值, 供『恢复默认参数』精确回滚
+sysctl_backup() {
+    local k="$1" v="$2"
+    mkdir -p "$(dirname "$SYSCTL_BAK")" 2>/dev/null || return 0
+    [[ -f "$SYSCTL_BAK" ]] || : > "$SYSCTL_BAK" 2>/dev/null || return 0
+    grep -qF "$k = " "$SYSCTL_BAK" 2>/dev/null && return 0
+    printf '%s = %s\n' "$k" "$v" >> "$SYSCTL_BAK" 2>/dev/null
+}
+
+# 完整调优参数表: 键|建议值|作用域|说明    (n=网络命名空间内可写; g=全局, 容器内通常不可写)
+tune_table_full() {
+    local mem buf
+    mem="$(mem_total_mb)"
+    buf="$(tune_buf_bytes "$mem")"
+    cat <<EOF
+net.core.default_qdisc|fq|n|BBR 配套 fq 队列(必选)
+net.ipv4.tcp_congestion_control|bbr|n|BBR 拥塞控制算法
+net.core.rmem_max|$buf|n|接收缓冲上限(按 ${mem}MB 内存缩放)
+net.core.wmem_max|$buf|n|发送缓冲上限
+net.core.rmem_default|1048576|n|默认接收缓冲
+net.core.wmem_default|1048576|n|默认发送缓冲
+net.ipv4.tcp_rmem|4096 87380 $buf|n|TCP 接收缓冲(内核自动调节)
+net.ipv4.tcp_wmem|4096 16384 $buf|n|TCP 发送缓冲(内核自动调节)
+net.core.optmem_max|65536|n|辅助数据结构缓冲
+net.core.somaxconn|32768|n|监听队列上限(高并发)
+net.core.netdev_max_backlog|16384|n|网卡收包队列(高并发关键)
+net.ipv4.tcp_max_syn_backlog|8192|n|SYN 半连接队列
+net.ipv4.tcp_fastopen|3|n|TCP Fast Open(客户端+服务端)
+net.ipv4.tcp_slow_start_after_idle|0|n|空闲后不重置拥塞窗口
+net.ipv4.tcp_notsent_lowat|16384|n|减少发送缓冲积压, 降延迟
+net.ipv4.tcp_mtu_probing|1|n|MTU 黑洞探测(防丢包卡死)
+net.ipv4.tcp_no_metrics_save|1|n|新连接不沿用历史拥塞状态
+net.ipv4.tcp_autocorking|0|n|关闭发送聚合, 降小包延迟
+net.ipv4.tcp_tw_reuse|1|n|TIME_WAIT 快速复用(短连接多)
+net.ipv4.tcp_fin_timeout|15|n|FIN_WAIT2 超时
+net.ipv4.tcp_max_tw_buckets|6000|n|TIME_WAIT 桶上限
+net.ipv4.tcp_keepalive_time|300|n|保活起始时间
+net.ipv4.tcp_keepalive_intvl|15|n|保活探测间隔
+net.ipv4.tcp_keepalive_probes|5|n|保活探测次数
+net.ipv4.ip_local_port_range|1024 65000|n|本地端口范围(中转/反代关键)
+net.ipv4.tcp_syncookies|1|n|SYN Flood 防护
+net.ipv4.tcp_rfc1337|1|n|丢弃 TIME_WAIT 状态的 RST
+net.ipv4.udp_rmem_min|8192|n|UDP 最小接收缓冲(QUIC/Hysteria2)
+net.ipv4.udp_wmem_min|8192|n|UDP 最小发送缓冲(QUIC/Hysteria2)
+net.ipv4.icmp_echo_ignore_broadcasts|1|n|忽略广播 ICMP
+net.ipv4.conf.all.rp_filter|0|n|关闭反向路径校验(多网卡中转友好)
+net.netfilter.nf_conntrack_max|65536|n|连接跟踪上限(NAT 中转关键)
+fs.file-max|1048576|g|系统文件句柄上限
+vm.swappiness|10|g|降低交换倾向(小内存机型)
 EOF
+}
+
+# 仅 BBR 参数表
+tune_table_bbr() {
+    cat <<'EOF'
+net.core.default_qdisc|fq|n|BBR 配套 fq 队列
+net.ipv4.tcp_congestion_control|bbr|n|BBR 拥塞控制算法
+net.ipv4.tcp_fastopen|3|n|TCP Fast Open
+net.ipv4.tcp_slow_start_after_idle|0|n|空闲后不重置拥塞窗口
+net.ipv4.tcp_mtu_probing|1|n|MTU 黑洞探测
+EOF
+}
+
+# 逐条应用(单条失败不影响其余), 结果放入 TUNE_OK / TUNE_APPLIED / TUNE_SKIP / TUNE_HOST / TUNE_FAIL
+apply_sysctl_table() {
+    local table="$1" key val scope desc
+    TUNE_OK=0; TUNE_APPLIED=""; TUNE_SKIP=""; TUNE_HOST=""; TUNE_FAIL=""
+    while IFS='|' read -r key val scope desc; do
+        [[ -z "$key" || "$key" == \#* ]] && continue
+        if ! sysctl_ok "$key"; then
+            TUNE_SKIP+="$key "
+            continue
+        fi
+        sysctl_backup "$key" "$(sysctl_cur "$key")"
+        if sysctl -w "${key}=${val}" >/dev/null 2>&1; then
+            TUNE_OK=$(( TUNE_OK + 1 ))
+            TUNE_APPLIED+="$key = $val"$'\n'
+        elif [[ "$scope" == "g" ]]; then
+            TUNE_HOST+="$key "
+        else
+            TUNE_FAIL+="$key "
+        fi
+    done <<< "$table"
+}
+
+_tune_list_warn() {
+    local msg="$1" list="$2" n
+    [[ -z "${list// /}" ]] && return 0
+    n="$(printf '%s\n' $list | grep -c .)"
+    warn "${msg} (${n} 项):"
+    printf '%s\n' $list | grep . | head -n 12 | sed 's/^/    - /'
+    [[ "$n" -gt 12 ]] && printf '    ... 其余 %d 项略\n' $(( n - 12 ))
+    return 0
+}
+
+report_tune_result() {
+    ok "本次生效 ${TUNE_OK} 项"
+    _tune_list_warn "当前内核无此参数, 已跳过" "$TUNE_SKIP"
+    _tune_list_warn "宿主级参数不可写(容器/权限限制, 不影响代理)" "$TUNE_HOST"
+    _tune_list_warn "写入被拒" "$TUNE_FAIL"
+    return 0
+}
+
+# Alpine(OpenRC): 确保开机会应用 /etc/sysctl.d/*.conf
+ensure_sysctl_boot() {
+    [[ -d /etc/init.d ]] || return 0
+    [[ -x /etc/init.d/sysctl ]] || return 0
+    command -v rc-update >/dev/null 2>&1 || return 0
+    if ! rc-update show boot 2>/dev/null | grep -qw sysctl; then
+        rc-update add sysctl boot >/dev/null 2>&1 && info "已把 sysctl 服务加入 boot 运行级(Alpine 开机自动应用)"
+    fi
+    return 0
+}
+
+# 应用参数表并写入持久化文件(只记录实际生效的项)
+write_tune_file() {
+    local table="$1" header="$2"
+    apply_sysctl_table "$table"
+    mkdir -p "$(dirname "$SYSCTL_FILE")" 2>/dev/null
+    {
+        printf '# ProxyBox 内核网络调优 — %s\n' "$header"
+        printf '# 生成: %s | 内存 %s MB | 缓冲上限 %s 字节(按内存自动缩放)\n' \
+            "$(date '+%F %T')" "$(mem_total_mb)" "$(tune_buf_bytes "$(mem_total_mb)")"
+        printf '# 仅记录本次实际生效的参数; 删除本文件或用菜单『恢复默认参数』即可还原\n'
+        printf '%s' "$TUNE_APPLIED"
+    } > "$SYSCTL_FILE" 2>/dev/null || warn "无法写入 $SYSCTL_FILE (本次仅临时生效, 重启后失效)"
+    ensure_sysctl_boot
+    return 0
 }
 
 enable_bbr_only() {
@@ -2271,28 +2429,42 @@ enable_bbr_only() {
     if ! version_ge "${KERNEL%%-*}" "4.9"; then
         die "内核 $(uname -r) 太旧(< 4.9)，无法启用 BBR，请先升级系统/内核。"
     fi
-    local virt="none"
+    local virt="none" tbl k
     command -v systemd-detect-virt >/dev/null 2>&1 && virt="$(systemd-detect-virt 2>/dev/null || echo unknown)"
-    if [[ "$virt" == "openvz" || "$virt" == "lxc" || "$virt" == "lxc-libvirt" ]]; then
-        warn "检测到 $virt 容器环境，若宿主内核不支持 BBR 会写入失败。"
+    case "$virt" in
+        openvz|lxc|lxc-libvirt) warn "检测到 $virt 容器环境: 内核参数由宿主机控制, 部分项可能写入失败。" ;;
+    esac
+    # bbr 属内核模块, 独立内核(非云厂商定制内核)需先加载
+    if ! grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+        info "内核未加载 bbr 模块, 尝试 modprobe tcp_bbr ..."
+        command -v modprobe >/dev/null 2>&1 && modprobe tcp_bbr >/dev/null 2>&1 || true
     fi
-    # 仅 BBR 模式保持原有 qdisc 或用 fq
-    cat > "$SYSCTL_FILE" <<EOF
-# ProxyBox BBR 配置
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-EOF
-    if sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1; then
-        ok "BBR 已写入/生效"
+    if ! grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+        err "当前内核不提供 bbr 算法 (可用: $(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null | tr ' ' '/'))"
+        err "容器内无法自行加载内核模块, 需宿主机内核支持 BBR。"
+        return 1
+    fi
+    tbl="$(tune_table_bbr)"
+    apply_sysctl_table "$tbl"
+    if [[ -f "$SYSCTL_FILE" ]]; then
+        # 已有完整调优文件: 只更新 BBR 相关行, 其余参数原样保留
+        for k in net.core.default_qdisc net.ipv4.tcp_congestion_control; do
+            sed -i "/^${k//./\\.} = /d" "$SYSCTL_FILE" 2>/dev/null
+        done
+        printf '%s' "$TUNE_APPLIED" >> "$SYSCTL_FILE" 2>/dev/null
     else
-        warn "部分参数写入失败, 逐条探测..."
-        sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 \
-            || die "无法设置 bbr (容器/内核限制)。"
+        write_tune_file "$tbl" "仅 BBR"
     fi
-    printf '  当前 设置: tcp_congestion_control=%s  default_qdisc=%s\n' \
-        "$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)" \
-        "$(cat /proc/sys/net/core/default_qdisc 2>/dev/null)"
-    ok "完成"
+    ensure_sysctl_boot
+    report_tune_result
+    printf '  当前设置: tcp_congestion_control=%s  default_qdisc=%s\n' \
+        "$(sysctl_cur net.ipv4.tcp_congestion_control)" "$(sysctl_cur net.core.default_qdisc)"
+    if [[ "$(sysctl_cur net.ipv4.tcp_congestion_control)" == "bbr" ]]; then
+        ok "BBR 已启用"
+    else
+        warn "BBR 未生效: 容器/内核限制了该参数 (tcping 正常但吞吐上不去时可换用『一键优化』或联系服务商)"
+    fi
+    return 0
 }
 
 net_optimize_full() {
@@ -2300,36 +2472,53 @@ net_optimize_full() {
     if ! version_ge "${KERNEL%%-*}" "4.9"; then
         die "内核 $(uname -r) 太旧(< 4.9)，无法启用。请升级系统！"
     fi
-    local virt="none"
+    local virt="none" mem
     command -v systemd-detect-virt >/dev/null 2>&1 && virt="$(systemd-detect-virt 2>/dev/null || echo unknown)"
-    if [[ "$virt" == "openvz" || "$virt" == "lxc" || "$virt" == "lxc-libvirt" ]]; then
-        warn "检测到 $virt 容器环境，可能无法应用，尝试后请自行确认。"
+    case "$virt" in
+        openvz|lxc|lxc-libvirt) warn "检测到 $virt 容器环境: 宿主级参数会写入失败, 已自动跳过并汇总提示, 不影响代理使用。" ;;
+    esac
+    mem="$(mem_total_mb)"
+    info "内存 ${mem} MB → 收发缓冲上限按 $(tune_buf_bytes "$mem") 字节设置(按内存自动缩放, 不会吃爆小内存)"
+    if ! grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+        command -v modprobe >/dev/null 2>&1 && modprobe tcp_bbr >/dev/null 2>&1 || true
     fi
-    write_tune_file
-    if sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1; then
-        ok "内核参数已生效"
-    else
-        warn "部分参数被拒绝(容器限制)，已尽量应用可用的参数。"
-        sysctl -p "$SYSCTL_FILE" 2>&1 | sed 's/^/    /' | head -n 15
-    fi
+    write_tune_file "$(tune_table_full)" "一键优化 (BBR + 全量网络参数)"
+    report_tune_result
     printf '  拥塞控制: %s   队列: %s\n' \
-        "$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)" \
-        "$(cat /proc/sys/net/core/default_qdisc 2>/dev/null)"
-    info "调优文件已保存: $SYSCTL_FILE (重启自动生效)"
+        "$(sysctl_cur net.ipv4.tcp_congestion_control)" "$(sysctl_cur net.core.default_qdisc)"
+    printf '  缓冲上限: rmem=%s  wmem=%s\n' \
+        "$(sysctl_cur net.core.rmem_max)" "$(sysctl_cur net.core.wmem_max)"
+    info "调优文件: $SYSCTL_FILE (重启自动生效)"
+    [[ "$(sysctl_cur net.ipv4.tcp_congestion_control)" == "bbr" ]] \
+        || warn "BBR 未能启用(容器/内核限制), 其余可用参数已尽量应用。"
     ok "一键优化完成"
+    return 0
 }
 
 net_restore() {
     title "恢复默认参数"
-    if [[ -f "$SYSCTL_FILE" ]]; then
-        rm -f "$SYSCTL_FILE"
+    local n=0 f=0 k v line
+    [[ -f "$SYSCTL_FILE" ]] && rm -f "$SYSCTL_FILE"
+    if [[ -s "$SYSCTL_BAK" ]]; then
+        info "按首次调优前的原值逐项回滚..."
+        while IFS= read -r line; do
+            [[ -z "$line" || "$line" == \#* ]] && continue
+            k="${line%% = *}"; v="${line#* = }"
+            [[ -z "$k" || -z "$v" ]] && continue
+            if sysctl -w "${k}=${v}" >/dev/null 2>&1; then n=$(( n + 1 )); else f=$(( f + 1 )); fi
+        done < "$SYSCTL_BAK"
+        rm -f "$SYSCTL_BAK"
+        ok "已回滚 ${n} 项参数"
+        [[ "$f" -gt 0 ]] && warn "${f} 项回滚失败(容器限制), 重启后由系统默认值接管。"
+    else
+        sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
+        sysctl -w net.core.default_qdisc=pfifo_fast >/dev/null 2>&1 || true
+        info "未找到调优前的原值记录, 已切回 cubic + pfifo_fast(其余参数重启后恢复默认)。"
     fi
-    # 回退到常见默认值
-    sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
-    sysctl -w net.core.default_qdisc=pfifo_fast >/dev/null 2>&1 || true
-    echo "  拥塞控制: $(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)"
-    echo "  队列: $(cat /proc/sys/net/core/default_qdisc 2>/dev/null)"
+    printf '  拥塞控制: %s   队列: %s\n' \
+        "$(sysctl_cur net.ipv4.tcp_congestion_control)" "$(sysctl_cur net.core.default_qdisc)"
     ok "已恢复默认参数"
+    return 0
 }
 
 menu_network() {
