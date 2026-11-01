@@ -15,7 +15,7 @@
 #===============================================================================
 
 #--------------------------------- 全局变量 ------------------------------------
-PROXYBOX_VERSION="1.4.6"
+PROXYBOX_VERSION="1.4.7"
 SB_BIN="/usr/local/bin/sing-box"
 SB_DIR="/etc/sing-box"
 SB_ENV_DIR="$SB_DIR/instance.d"          # 每个协议一份参数(env)
@@ -2451,24 +2451,31 @@ menu_reinstall() {
     info "重装由同仓库的 reinstall-vm.sh 完成: KVM 走 netboot+preseed 全自动安装, LXC/容器走 rootfs 原位替换。"
     ask "确认继续? [y/N]" "n"
     [[ ! "$RESULT" =~ ^[yY]([eE][sS])?$ ]] && { info "已取消"; return; }
-    local rf="/usr/local/bin/reinstall-vm.sh" okdl=0 u base
-    if [[ ! -f "$rf" ]]; then
-        info "下载重装脚本 reinstall-vm.sh ..."
-        base="https://raw.githubusercontent.com/xiaoluaibb/zihua/main/reinstall-vm.sh"
-        while IFS= read -r u; do
-            [[ -z "$u" ]] && continue
-            printf '%s    下载: %s%s\n' "$GRAY" "$u" "$NC"
-            if curl -fsSL --connect-timeout 8 --max-time 120 -o "$rf" "$u" 2>/dev/null && [[ -s "$rf" ]] && head -n1 "$rf" | grep -q "bin/"; then
-                okdl=1; break
-            fi
-        done <<EOF
+    local rf="/usr/local/bin/reinstall-vm.sh" okdl=0 u base tmpf="$rf.new"
+    # 每次都尝试拉取最新版(修复过 bug 的重装脚本才能生效), 失败则回退本地已有副本
+    info "获取最新重装脚本 reinstall-vm.sh ..."
+    base="https://raw.githubusercontent.com/xiaoluaibb/zihua/main/reinstall-vm.sh"
+    while IFS= read -r u; do
+        [[ -z "$u" ]] && continue
+        if curl -fsSL --connect-timeout 8 --max-time 120 -o "$tmpf" "$u" 2>/dev/null && [[ -s "$tmpf" ]] && head -n1 "$tmpf" | grep -q "bin/"; then
+            okdl=1; break
+        fi
+    done <<EOF
 $base
 https://gh-proxy.com/$base
 https://ghfast.top/$base
+https://cdn.jsdelivr.net/gh/xiaoluaibb/zihua@main/reinstall-vm.sh
 EOF
-        if [[ "$okdl" != "1" ]]; then rm -f "$rf"; err "下载失败, 请检查网络后重试"; return; fi
-        chmod 700 "$rf"
-        ok "已保存到 $rf (以后可直接 bash $rf 单独运行)"
+    if [[ "$okdl" == "1" ]]; then
+        mv -f "$tmpf" "$rf" && chmod 700 "$rf"
+        ok "重装脚本已更新: $rf ($(grep -m1 'REINSTALL_VM_VERSION=' "$rf" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo '版本未知'))"
+    else
+        rm -f "$tmpf"
+        if [[ -f "$rf" ]]; then
+            warn "在线更新失败, 使用本地已有副本: $rf"
+        else
+            err "下载失败且本地无副本, 请检查网络后重试"; return
+        fi
     fi
     info "启动重装脚本(交互式菜单, 随时输入 q 可退出)..."
     bash "$rf" || true
