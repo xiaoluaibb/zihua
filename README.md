@@ -38,13 +38,9 @@ bash zihua.sh
 
 ## 功能简介
 
-- 统一内核：sing-box 一个服务承载多入站协议，方便增删改
-  - Shadowsocks 2022
-  - Hysteria2
-  - TUIC
-  - VLESS-Reality-Vision（无域名，偷站伪装）
-  - VLESS-Reality-gRPC
-  - VLESS-Vision-TLS（带域名 + 自签证书，兼容性最好，适合 Reality 兼容差的客户端）
+- 双内核架构（v1.4.0 起）：
+  - sing-box：SS2022 / Hysteria2 / TUIC / VLESS-Vision-TLS（自签证书）
+  - Xray：VLESS-Reality-Vision / VLESS-Reality-gRPC（配置与 v2ray-agent 同款模板，独立服务 zihua-xray，抗封锁首选）
 - 多协议同时运行：各协议独立实例与独立证书，TCP 与 UDP 端口可同号并存（如 Vision 用 TCP 443，Hysteria2 用 UDP 443）
 - Reality 偷域名：内置大厂域名可选（也可偷自己的域名），选择后自动测试目标是否支持 TLS1.3，并检测 Cloudflare CDN 代理（套 CDN 的域名会被警告，防止 VPS 流量被滥用）
 - 安装后自动验证：服务运行状态 + 端口监听检查；卸载后自动验证程序 / 配置 / 进程清除干净
