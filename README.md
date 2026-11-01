@@ -42,10 +42,12 @@ bash zihua.sh
   - Shadowsocks 2022
   - Hysteria2
   - TUIC
-  - VLESS-Reality-Vision
+  - VLESS-Reality-Vision（无域名，偷站伪装）
   - VLESS-Reality-gRPC
+  - VLESS-Vision-TLS（带域名 + 自签证书，兼容性最好，适合 Reality 兼容差的客户端）
 - 多协议同时运行：各协议独立实例与独立证书，TCP 与 UDP 端口可同号并存（如 Vision 用 TCP 443，Hysteria2 用 UDP 443）
-- Reality 偷域名：内置大厂域名可选（也可偷自己的域名），选择后自动测试目标是否支持 TLS1.3
+- Reality 偷域名：内置大厂域名可选（也可偷自己的域名），选择后自动测试目标是否支持 TLS1.3，并检测 Cloudflare CDN 代理（套 CDN 的域名会被警告，防止 VPS 流量被滥用）
+- 安装后自动验证：服务运行状态 + 端口监听检查；卸载后自动验证程序 / 配置 / 进程清除干净
 - TLS 证书三种来源（Hysteria2 / TUIC）：
   1. 自签证书：无域名一键生成，客户端开『允许不安全』
   2. 已有证书文件：填 acme.sh / certbot / 宝塔 签发的 pem + key 路径
@@ -62,8 +64,8 @@ bash zihua.sh
 | 项目 | 要求 |
 |------|------|
 | 系统 | Debian 10+ / Ubuntu 18.04+ / Rocky / Alma / CentOS 7+(部分) / Fedora / Alpine 3.15+ / Arch |
-| 组件 | 需要 systemd |
-| 权限 | root（sudo）运行 |
+| 初始化 | systemd 或 OpenRC（Alpine 原生可用） |
+| 权限 | root 直接运行（无需 sudo） |
 
 ## 常见问题
 
