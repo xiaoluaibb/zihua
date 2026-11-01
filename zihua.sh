@@ -743,11 +743,15 @@ xsvc_stop_now() { if [[ "$INIT_SYS" == "systemd" ]]; then systemctl disable --no
 xsvc_log_tail() { if [[ "$INIT_SYS" == "systemd" ]]; then journalctl -u "$XRAY_SERVICE" -n "${1:-60}" --no-pager -e 2>/dev/null; else tail -n "${1:-60}" "$XRAY_LOG_FILE" 2>/dev/null; fi; }
 xsvc_own_pids() { pgrep -f "xray run -config ${XRAY_CFG}" 2>/dev/null | tr '\n' ' '; }
 
-# Xray 配置自检(兼容新旧命令行形式)
+# Xray 配置自检(兼容新旧命令行形式); 失败时把内核真实报错打印到 stderr 便于排查
 xray_test_config() {
-    local cfg="$1"
-    "$XRAY_BIN" run -test -config "$cfg" >/dev/null 2>&1 && return 0
-    "$XRAY_BIN" -test -config "$cfg" >/dev/null 2>&1
+    local cfg="$1" out rc
+    out="$("$XRAY_BIN" run -test -config "$cfg" 2>&1)"; rc=$?
+    if [[ "$rc" == "0" ]]; then return 0; fi
+    out="$("$XRAY_BIN" -test -config "$cfg" 2>&1)"; rc=$?
+    if [[ "$rc" == "0" ]]; then return 0; fi
+    echo "$out" | tail -n 2 | sed 's/^/    /' >&2
+    return 1
 }
 
 # 从 env 文件读单个字段(不污染全局状态): env_get <key> <FIELD>
@@ -837,13 +841,14 @@ xray_rebuild_config() {
         all+="${all:+,}$frag"
     done
     if [[ -z "$all" ]]; then return 2; fi
-    printf '{"log":{"loglevel":"warning"},"inbounds":[%s],"outbounds":[{"protocol":"freedom","tag":"direct"}]}' "$all" > "${XRAY_CFG}.tmp"
-    if ! xray_test_config "${XRAY_CFG}.tmp"; then
-        mv -f "${XRAY_CFG}.tmp" "${XRAY_CFG}.testfail" 2>/dev/null
-        err "Xray 配置校验失败, 内容已保留在 ${XRAY_CFG}.testfail"
+    # 注意: 临时文件必须以 .json 结尾, 新版 Xray 按扩展名识别配置格式, .tmp 会被拒绝加载
+    printf '{"log":{"loglevel":"warning"},"inbounds":[%s],"outbounds":[{"protocol":"freedom","tag":"direct"}]}' "$all" > "${XRAY_CFG}.tmp.json"
+    if ! xray_test_config "${XRAY_CFG}.tmp.json"; then
+        mv -f "${XRAY_CFG}.tmp.json" "${XRAY_CFG}.testfail.json" 2>/dev/null
+        err "Xray 配置校验失败, 内容已保留在 ${XRAY_CFG}.testfail.json (上方为内核报错)"
         return 1
     fi
-    mv -f "${XRAY_CFG}.tmp" "$XRAY_CFG"
+    mv -f "${XRAY_CFG}.tmp.json" "$XRAY_CFG"
     # 老版本残留: rv/rg 曾由 sing-box 承载, 迁移到 Xray 后移除其配置, 避免端口双占用
     rm -f "$SB_CFG_DIR/vless-rv.json" "$SB_CFG_DIR/vless-rg.json"
     return 0
