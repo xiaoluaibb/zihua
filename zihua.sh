@@ -633,6 +633,8 @@ svc_restart() {
 # 内核路由: Reality 协议走 Xray, 其余走 sing-box
 proto_kernel() { case "$1" in vless-rv|vless-rg) echo xray ;; *) echo sing-box ;; esac; }
 kernel_active() { if [[ "$(proto_kernel "$1")" == "xray" ]]; then xsvc_active; else svc_active; fi; }
+# 按协议所属内核打印日志尾部(避免 Xray 协议去 tail sing-box 的日志, 看不到真实报错)
+kernel_log_tail() { if [[ "$(proto_kernel "$1")" == "xray" ]]; then xsvc_log_tail "${2:-20}"; else svc_log_tail "${2:-20}"; fi; }
 
 xray_download_urls() {
     local fname
@@ -832,6 +834,11 @@ xray_rebuild_config() {
         pk="$(env_get "$k" REALITY_PK)"; sid="$(env_get "$k" SHORT_ID)"
         rpc="$(env_get "$k" RPC)"
         [[ -z "$p" || -z "$u" || -z "$sh" || -z "$pk" ]] && { warn "跳过 $k: 参数文件不完整"; continue; }
+        if ! reality_key_valid "$pk"; then
+            warn "$k 的 Reality 私钥格式异常(${#pk} 位, 应为 43 位 base64url)!"
+            warn "  这种密钥能通过配置校验, 但 Xray 启动时会立即退出(端口不监听)。"
+            warn "  修复: 代理管理 → 修改配置 → 选『重新生成伪装域名(并重置 Reality 密钥)』后重新导入链接。"
+        fi
         sp="${sp:-443}"
         if [[ "$k" == "vless-rv" ]]; then
             frag="$(xray_inbound_rv "$p" "$u" "$sh" "$sp" "$pk" "$sid")"
@@ -1300,10 +1307,14 @@ ossl_reality_keypair() {
     pubhex="$(openssl pkey -in "$pem" -pubout -text -noout 2>/dev/null | awk '/pub:/{f=1;next} f' | tr -d ' :\n')"
     rm -rf "$dir"
     [[ "$privhex" =~ ^[0-9a-fA-F]{64}$ && "$pubhex" =~ ^[0-9a-fA-F]{64}$ ]] || return 1
-    OSSL_PRIV="$(printf '%b' "$(echo "$privhex" | sed 's/../\\x&/g')" | openssl base64 -A 2>/dev/null)"
-    OSSL_PUB="$(printf '%b' "$(echo "$pubhex" | sed 's/../\\x&/g')" | openssl base64 -A 2>/dev/null)"
-    [[ ${#OSSL_PRIV} -ge 40 && ${#OSSL_PUB} -ge 40 ]]
+    # Reality 只接受 base64url 无填充(43 字符): 标准 base64 的 + / = 必须转换/去除, 否则内核启动即退出
+    OSSL_PRIV="$(printf '%b' "$(echo "$privhex" | sed 's/../\\x&/g')" | openssl base64 -A 2>/dev/null | tr '+/' '-_' | tr -d '=')"
+    OSSL_PUB="$(printf '%b' "$(echo "$pubhex" | sed 's/../\\x&/g')" | openssl base64 -A 2>/dev/null | tr '+/' '-_' | tr -d '=')"
+    [[ ${#OSSL_PRIV} -eq 43 && ${#OSSL_PUB} -eq 43 ]]
 }
+
+# Reality 密钥格式校验: X25519 密钥必须是 43 位 base64url(无填充)
+reality_key_valid() { [[ "$1" =~ ^[A-Za-z0-9_-]{43}$ ]]; }
 
 # reality 相关公共询问: 设置 SNI_HOST/SNI_PORT/REALITY_PK/REALITY_PUB/SHORT_ID
 ask_reality_params() {
@@ -1352,23 +1363,26 @@ ask_reality_params() {
         fi
     done
     info "生成 Reality 密钥对..."
-    local kp
-    kp="$("$SB_BIN" generate reality-keypair 2>&1)"
-    REALITY_PK="$(echo "$kp" | awk '/PrivateKey/{print $2}')"
-    REALITY_PUB="$(echo "$kp" | awk '/PublicKey/{print $2}')"
-    # 兜底: sing-box 无法执行时, 用 openssl 直接生成 X25519 密钥对 (Reality 兼容)
-    if [[ -z "$REALITY_PK" ]]; then
-        warn "sing-box 生成密钥失败, 内核输出: $(echo "$kp" | head -n1)"
-        warn "尝试 openssl 兜底方案..."
-        if ossl_reality_keypair; then
+    local kp tries=0
+    while (( tries < 2 )); do
+        tries=$((tries+1))
+        kp="$("$SB_BIN" generate reality-keypair 2>&1)"
+        REALITY_PK="$(echo "$kp" | awk '/PrivateKey/{print $2}')"
+        REALITY_PUB="$(echo "$kp" | awk '/PublicKey/{print $2}')"
+        reality_key_valid "$REALITY_PK" && reality_key_valid "$REALITY_PUB" && break
+        # 兜底: sing-box 无法执行/输出异常时, 用 openssl 直接生成 X25519 密钥对(转 base64url)
+        warn "密钥格式异常(私钥 ${#REALITY_PK} 位/公钥 ${#REALITY_PUB} 位, 应为 43 位), 尝试 openssl 兜底..."
+        if ossl_reality_keypair && reality_key_valid "$OSSL_PRIV" && reality_key_valid "$OSSL_PUB"; then
             REALITY_PK="$OSSL_PRIV"
             REALITY_PUB="$OSSL_PUB"
             ok "openssl 兜底生成成功"
+            break
         fi
-    fi
-    if [[ -z "$REALITY_PK" ]]; then
-        err "两种方式均无法生成密钥。请手动排查: 执行 '$SB_BIN version' 看内核是否能运行;"
-        err "Alpine 系统先执行: apk add gcompat libstdc++ openssl 后重跑本脚本。"
+    done
+    if ! reality_key_valid "$REALITY_PK" || ! reality_key_valid "$REALITY_PUB"; then
+        err "Reality 密钥生成异常: 私钥 ${#REALITY_PK} 位 / 公钥 ${#REALITY_PUB} 位, 正常均应为 43 位 base64url。"
+        err "长度不对的密钥能通过配置校验, 但内核启动时会立即退出(端口不监听)。"
+        err "请手动排查: '$SB_BIN version' 是否可运行; Alpine 先执行 apk add gcompat libstdc++ openssl。"
         die "生成 Reality 密钥失败。"
     fi
     SHORT_ID="$(gen_hex 4)"
@@ -1680,7 +1694,8 @@ verify_installed() {
     port="$(grep -E '^PORT=' "$SB_ENV_DIR/$k.env" 2>/dev/null | head -n1 | cut -d= -f2 | tr -d "'\"")"
     [[ -z "$port" ]] && return 0
     if ! kernel_active "$k"; then
-        warn "安装后验证: 服务未运行! 请到『代理管理→查看运行日志』排查。"
+        warn "安装后验证: 服务未运行! 最近日志($( [[ "$(proto_kernel "$k")" == "xray" ]] && echo "$XRAY_LOG_FILE" || echo "$LOG_FILE" )):"
+        kernel_log_tail "$k" 15 | sed 's/^/    /'
         return 1
     fi
     scheme="tcp"; case "$k" in hy2|tuic) scheme="udp" ;; esac
@@ -1692,8 +1707,8 @@ verify_installed() {
         fi
         sleep 1
     done
-    warn "安装后验证: $scheme 端口 $port 未监听! 日志最后几行如下:"
-    svc_log_tail 8 | sed 's/^/    /'
+    warn "安装后验证: $scheme 端口 $port 未监听! 最近日志:"
+    kernel_log_tail "$k" 20 | sed 's/^/    /'
     return 1
 }
 
@@ -1729,6 +1744,12 @@ apply_one() {
             return 1
         fi
         sleep 1
+        # 启动后存活检查: 坏密钥等运行期错误会让 Xray 启动即退出, 这里立刻报出来
+        if ! xsvc_active; then
+            err "Xray 启动后立即退出(进程不存活), 最近日志如下:"
+            xsvc_log_tail 20 | sed 's/^/    /'
+            return 1
+        fi
     else
         ensure_service
         if ! gen_config "$k"; then
@@ -1819,7 +1840,8 @@ rewrite_env() {
             val="${val//\'/}"
             [[ -n "$val" ]] && printf "%s='%s'\n" "$var" "$val"
         done
-        echo "CREATED="$(date '+%F %T')""
+        # 必须带引号: 无引号时 source 会把时间部分当成命令执行(line N: command not found)
+        printf "CREATED='%s'\n" "$(date '+%F %T')"
     } > "$SB_ENV_DIR/$k.env"
     chmod 600 "$SB_ENV_DIR/$k.env"
 }
