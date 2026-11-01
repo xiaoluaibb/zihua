@@ -15,7 +15,7 @@
 #===============================================================================
 
 #--------------------------------- 全局变量 ------------------------------------
-PROXYBOX_VERSION="1.4.5"
+PROXYBOX_VERSION="1.4.6"
 SB_BIN="/usr/local/bin/sing-box"
 SB_DIR="/etc/sing-box"
 SB_ENV_DIR="$SB_DIR/instance.d"          # 每个协议一份参数(env)
@@ -2545,10 +2545,10 @@ do_self_update() {
     self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
     info "备份当前版本到 $backup ..."
     cp -f "$self" "$backup" 2>/dev/null || warn "备份失败(继续更新)"
-    if [[ "$self" != "$dest" ]]; then
-        install -m 700 "$tmp" "$dest" 2>/dev/null || warn "更新快捷命令 $dest 失败"
-    fi
+    # 先替换当前执行文件, 成功后再同步另一份入口, 保证 /root/zihua.sh 与快捷命令 zihua 版本一致
     install -m 700 "$tmp" "$self" 2>/dev/null || { err "替换脚本失败(旧版已保留在 $backup)"; return 1; }
+    [[ "$self" != "$dest" ]] && install -m 700 "$tmp" "$dest" 2>/dev/null || true
+    [[ "$self" != "/root/zihua.sh" ]] && install -m 700 "$tmp" "/root/zihua.sh" 2>/dev/null || true
     ok "已更新到 v$remote_ver (旧版备份: $backup)"
     ask "立即重启脚本使用新版本? [Y/n]" "y"
     if [[ "$RESULT" =~ ^[yY]([eE][sS])?$ ]]; then
@@ -2702,10 +2702,16 @@ check_init() {
 
 # 安装/更新 zihua 快捷命令: 以后直接输入 zihua 即可再次运行
 install_zihua_cmd() {
-    local self dest="/usr/local/bin/zihua"
+    local self dest="/usr/local/bin/zihua" sv dv
     self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
     [[ -z "$self" || "$self" == "$dest" ]] && return 0
     if ! cmp -s "$self" "$dest" 2>/dev/null; then
+        # 防止旧版 /root/zihua.sh 覆盖已更新的快捷命令(版本漂移回退)
+        sv="$(grep -m1 'PROXYBOX_VERSION=' "$self" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
+        dv="$(grep -m1 'PROXYBOX_VERSION=' "$dest" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
+        if [[ -n "$sv" && -n "$dv" ]] && ver_gt "$dv" "$sv"; then
+            return 0
+        fi
         if install -m 700 "$self" "$dest" 2>/dev/null; then
             ok "快捷命令已就绪: 以后直接输入 zihua 即可再次打开本脚本"
         fi
