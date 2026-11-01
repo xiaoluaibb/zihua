@@ -15,7 +15,7 @@
 #===============================================================================
 
 #--------------------------------- 全局变量 ------------------------------------
-PROXYBOX_VERSION="1.4.3"
+PROXYBOX_VERSION="1.4.4"
 SB_BIN="/usr/local/bin/sing-box"
 SB_DIR="/etc/sing-box"
 SB_ENV_DIR="$SB_DIR/instance.d"          # 每个协议一份参数(env)
@@ -979,9 +979,10 @@ gen_config() {
         ss2022)   cfg_body_ss2022   > "$cfg" ;;
         hy2)      cfg_body_hy2      > "$cfg" ;;
         tuic)     cfg_body_tuic     > "$cfg" ;;
-        vless-rv) cfg_body_vless_rv > "$cfg" ;;
-        vless-rg) cfg_body_vless_rg > "$cfg" ;;
         vless-ts) cfg_body_vless_ts > "$cfg" ;;
+        # Reality(vless-rv/vless-rg) 由 Xray 内核接管, 绝不能再生成 sing-box 配置,
+        # 否则 sing-box 与 Xray 同时监听同一端口 → 客户端握手失败(超时)
+        vless-rv|vless-rg) rm -f "$cfg" "$bak"; rm -f "$errf"; return 0 ;;
         *) err "未知协议: $k"; rm -f "$errf"; return 1 ;;
     esac
     chmod 600 "$cfg"
@@ -1000,12 +1001,20 @@ gen_config() {
 # 重新生成全部配置并重启
 apply_all() {
     ensure_service
-    local k rc=0
+    local k rc=0 has_reality=0
     for k in $(installed_keys); do
+        # Reality 协议走 Xray 内核, 跳过 sing-box 配置生成
+        case "$k" in vless-rv|vless-rg) has_reality=1; continue ;; esac
         gen_config "$k" || rc=1
     done
+    # 清掉 sing-box 目录里的 Reality 残留(老版本迁移遗留), 避免与 Xray 抢端口
+    rm -f "$SB_CFG_DIR/vless-rv.json" "$SB_CFG_DIR/vless-rg.json"
     (( rc == 1 )) && return 1
     svc_restart
+    # 有 Reality 协议时重建并重启 Xray
+    if [[ "$has_reality" == "1" ]]; then
+        ensure_xray_core && xray_ensure_service && xray_rebuild_config && xsvc_restart
+    fi
 }
 
 cfg_body_ss2022() {
@@ -1671,6 +1680,8 @@ ENV
 # 清理孤儿配置: configs 下有 json 但 instance.d 缺少对应 env 的残留文件(防止已删协议继续被 sing-box 加载)
 cleanup_orphan_configs() {
     local f k
+    # Reality 由 Xray 内核接管, sing-box 配置目录里绝不允许残留 vless-rv/rg (否则抢端口)
+    rm -f "$SB_CFG_DIR/vless-rv.json" "$SB_CFG_DIR/vless-rg.json"
     for f in "$SB_CFG_DIR"/*.json; do
         [[ -e "$f" ]] || return 0
         k="$(basename "$f" .json)"
@@ -1736,8 +1747,9 @@ apply_one() {
             err "Xray 配置生成/校验失败"
             return 1
         fi
-        # sing-box 若还挂着旧 Reality 入站(老版本迁移), 先释放端口
-        if svc_active && [[ -f "$SB_CFG_DIR/vless-rv.json" || -f "$SB_CFG_DIR/vless-rg.json" ]]; then
+        # sing-box 若还挂着旧 Reality 入站(老版本迁移), 必须删除后重启释放端口, 否则与 Xray 抢端口
+        if [[ -f "$SB_CFG_DIR/vless-rv.json" || -f "$SB_CFG_DIR/vless-rg.json" ]]; then
+            rm -f "$SB_CFG_DIR/vless-rv.json" "$SB_CFG_DIR/vless-rg.json"
             svc_do_restart >/dev/null 2>&1 || true
         fi
         if ! xsvc_restart; then
