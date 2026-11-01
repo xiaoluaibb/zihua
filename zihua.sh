@@ -10,11 +10,11 @@
 #             VLESS-Reality-gRPC 共用一个内核，一个服务多入站，方便增删改)
 #  多协议   : 各协议独立实例+独立证书, TCP/UDP 端口可复用, 可同时运行
 #  附加功能 : 一键重装系统 (调用同仓库 reinstall-vm.sh, 支持 KVM/LXC)
-#  版本     : v1.2.1  (2026-10)
+#  版本     : v1.3.0  (2026-11)
 #===============================================================================
 
 #--------------------------------- 全局变量 ------------------------------------
-PROXYBOX_VERSION="1.2.3"
+PROXYBOX_VERSION="1.3.0"
 SB_BIN="/usr/local/bin/sing-box"
 SB_DIR="/etc/sing-box"
 SB_ENV_DIR="$SB_DIR/instance.d"          # 每个协议一份参数(env)
@@ -742,6 +742,7 @@ gen_config() {
         tuic)     cfg_body_tuic     > "$cfg" ;;
         vless-rv) cfg_body_vless_rv > "$cfg" ;;
         vless-rg) cfg_body_vless_rg > "$cfg" ;;
+        vless-ts) cfg_body_vless_ts > "$cfg" ;;
         *) err "未知协议: $k"; rm -f "$errf"; return 1 ;;
     esac
     chmod 600 "$cfg"
@@ -905,6 +906,31 @@ cfg_body_vless_rg() {
 EOF
 }
 
+# VLESS-Vision-TLS(带域名·自签证书): 标准 TLS + 自签证书, 兼容性最好
+cfg_body_vless_ts() {
+    cat <<EOF
+{
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "in-vless-ts",
+      "listen": "::",
+      "listen_port": ${PORT},
+      "users": [
+        { "uuid": "${UUID}", "flow": "xtls-rprx-vision" }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "${DOMAIN}",
+        "certificate_path": "${SB_CERT_DIR}/vless-ts.pem",
+        "key_path": "${SB_CERT_DIR}/vless-ts.key"
+      }
+    }
+  ]
+}
+EOF
+}
+
 #--------------------------------- 分享链接生成 ----------------------------------
 insecure_hint() {
     if [[ "$CERT_MODE" == "manual" ]]; then echo "0"; else echo "1"; fi
@@ -937,6 +963,10 @@ link_vless_rg() {
     echo "vless://${UUID}@${IP}:${PORT}?type=grpc&security=reality&serviceName=${RPC}&sni=${SNI_HOST}&fp=chrome&pbk=${REALITY_PUB}&sid=${SHORT_ID}#${NODE_NAME}"
 }
 
+link_vless_ts() {
+    echo "vless://${UUID}@${IP}:${PORT}?type=tcp&security=tls&flow=xtls-rprx-vision&sni=${DOMAIN}&fp=chrome&allowInsecure=1#${NODE_NAME}"
+}
+
 # 打印某协议的分享信息: print_share <key>
 print_share() {
     local k="$1"
@@ -954,6 +984,7 @@ print_share() {
         tuic)     raw="$(link_tuic)" ;;
         vless-rv) raw="$(link_vless_rv)" ;;
         vless-rg) raw="$(link_vless_rg)" ;;
+        vless-ts) raw="$(link_vless_ts)" ;;
     esac
     hr
     title "${k} 节点信息"
@@ -977,6 +1008,10 @@ print_share() {
             [[ "$k" == "vless-rg" ]] && printf '  grpc 服务名: %s\n' "$RPC"
             printf '  公钥(pbk): %s\n' "$REALITY_PUB"
             printf '  short_id(sid): %s\n' "$SHORT_ID" ;;
+        vless-ts)
+            printf '  UUID: %s\n' "$UUID"
+            printf '  域名(SNI): %s\n' "$DOMAIN"
+            printf '  证书: 自签证书(客户端需开启『允许不安全』/allowInsecure)\n' ;;
     esac
     echo
     info "分享链接(可直接导入主流客户端如 v2rayN / v2rayNG / NekoBox / Shadowrocket / Streisand):"
@@ -1008,6 +1043,19 @@ test_tls13() {
     command -v timeout >/dev/null 2>&1 || return 2
     out="$(echo | timeout 8 openssl s_client -connect "${host}:${port}" -servername "$host" -tls1_3 2>/dev/null)"
     [[ "$out" == *"TLSv1.3"* ]] || return 1
+    return 0
+}
+
+# 检查 Reality 目标域名是否套了 Cloudflare CDN(参考 v2ray-agent checkRealityDest):
+# 返回 1=建议更换, 0=可用
+check_reality_dest() {
+    local trace
+    trace="$(curl -s --connect-timeout 5 --max-time 8 "https://$(echo "$1" | cut -d ':' -f1)/cdn-cgi/trace" 2>/dev/null | grep 'visit_scheme=https')"
+    if [[ -n "$trace" ]]; then
+        warn "检测到 $1 启用了 Cloudflare CDN 代理。Reality 目标域名套 CDN 会导致你的 VPS 流量被他人滥用，强烈不建议。"
+        ask_choice "如何处理?" 2 1 "换一个域名(推荐)" 2 "仍要使用(自行承担风险)"
+        [[ "$RESULT" == "1" ]] && return 1
+    fi
     return 0
 }
 
@@ -1047,8 +1095,8 @@ ask_reality_params() {
             2) SNI_HOST="www.microsoft.com" ;;
             3) SNI_HOST="www.bing.com" ;;
             4) SNI_HOST="www.spotify.com" ;;
-            5) ask_valid "输入你自己的域名" "" v_domain; SNI_HOST="$RESULT" ;;
-            6) ask_valid "输入自定义目标域名" "www.nvidia.com" v_domain; SNI_HOST="$RESULT" ;;
+            5) ask_valid "输入你自己的域名" "" v_domain; SNI_HOST="$RESULT"; check_reality_dest "$SNI_HOST" || continue ;;
+            6) ask_valid "输入自定义目标域名" "www.nvidia.com" v_domain; SNI_HOST="$RESULT"; check_reality_dest "$SNI_HOST" || continue ;;
         esac
         while :; do
             ask_valid "目标站点端口(一般保持 443, 除非目标站用非标 TLS 端口)" "443" v_port
@@ -1342,6 +1390,36 @@ ENV
     ok "VLESS-Reality-gRPC 安装完成"
 }
 
+#--------------------------------- VLESS-Vision-TLS(带域名·自签证书) ---------------
+# 参考 v2ray-agent 的 VLESS+TLS_Vision 思路: 标准 TLS + 自签证书, 对 Reality 兼容性差
+# 的客户端(部分 Shadowrocket 旧版等)是可靠的替代方案; 域名仅作 SNI 伪装, 无需真实解析
+add_vless_ts() {
+    pre_install "安装 VLESS-Vision-TLS(带域名·自签证书)" "与 Reality 版同样使用 Vision 流控, 但走标准 TLS+自签证书: 需要一个域名(仅作伪装/SNI, 无需真实解析、无需购买证书), 客户端开启『允许不安全』即可。适合 Reality 兼容性差的客户端。" || return 1
+    ask_port 8443 tcp
+    title "域名与自签证书"
+    info "填写规则: 一个你拥有的域名, 仅作为 SNI 伪装用, 不需要真的解析到本机。"
+    ask_valid "输入你的域名" "" v_domain
+    DOMAIN="$RESULT"
+    info "生成自签证书(10 年有效期, 含 SAN)..."
+    gen_self_signed_cert vless-ts "$DOMAIN" >/dev/null || die "自签证书生成失败, 请确认已安装 openssl。"
+    ok "证书就绪: $SB_CERT_DIR/vless-ts.pem"
+    ask_valid "输入 VLESS UUID" "$(gen_uuid)" v_uuid
+    UUID="$RESULT"
+    ask_node_name "vless-ts-${DOMAIN}"
+    SAVE_NAME="$NODE_NAME"
+    cat > "$SB_ENV_DIR/vless-ts.env" <<ENV
+PORT=$PORT
+UUID='$UUID'
+DOMAIN='$DOMAIN'
+NAME='$SAVE_NAME'
+CREATED="$(date '+%F %T')"
+ENV
+    chmod 600 "$SB_ENV_DIR/vless-ts.env"
+    apply_one "vless-ts" || return 1
+    print_share "vless-ts"
+    ok "VLESS-Vision-TLS 安装完成"
+}
+
 #--------------------------------- 安装后应用 -------------------------------------
 # 应用某个协议: 生成配置并重启服务 (参数已在 env 文件中)
 # 清理孤儿配置: configs 下有 json 但 instance.d 缺少对应 env 的残留文件(防止已删协议继续被 sing-box 加载)
@@ -1355,6 +1433,24 @@ cleanup_orphan_configs() {
             warn "已清理残留配置: $k.json (对应协议参数文件不存在)"
         fi
     done
+}
+
+# 安装/修改后验证(参考 v2ray-agent 的安装后校验): 服务活跃 + 端口监听
+verify_installed() {
+    local k="$1" port scheme
+    port="$(grep -E '^PORT=' "$SB_ENV_DIR/$k.env" 2>/dev/null | head -n1 | cut -d= -f2 | tr -d "'\"")"
+    [[ -z "$port" ]] && return 0
+    if ! svc_active; then
+        warn "安装后验证: 服务未运行! 请到『代理管理→查看运行日志』排查。"
+        return 1
+    fi
+    scheme="tcp"; case "$k" in hy2|tuic) scheme="udp" ;; esac
+    if port_in_use "$port" "$scheme"; then
+        ok "安装后验证通过: 服务运行中, $scheme 端口 $port 正在监听"
+    else
+        warn "安装后验证: $scheme 端口 $port 未监听! 配置可能未生效, 请查看日志。"
+        return 1
+    fi
 }
 
 apply_one() {
@@ -1373,6 +1469,7 @@ apply_one() {
         err "服务重启失败，请尝试『代理管理』中的查看日志"
         return 1
     fi
+    verify_installed "$k"
     return 0
 }
 
@@ -1398,6 +1495,7 @@ menu_list() {
             tuic)     proto_name="TUIC v5 (UDP/QUIC)" ;;
             vless-rv) proto_name="VLESS-Reality-Vision (TCP)" ;;
             vless-rg) proto_name="VLESS-Reality-gRPC (TCP)" ;;
+            vless-ts) proto_name="VLESS-Vision-TLS自签 (TCP)" ;;
             *)        proto_name="未知" ;;
         esac
         printf '  %-10s %-32s %-8s %s\n' "$k" "$proto_name" "${PORT}" "$st"
@@ -1464,7 +1562,35 @@ menu_edit() {
         tuic)     menu_edit_tuic "$k" ;;
         vless-rv) menu_edit_vless "$k" rv ;;
         vless-rg) menu_edit_vless "$k" rg ;;
+        vless-ts) menu_edit_ts "$k" ;;
     esac
+}
+
+menu_edit_ts() {
+    local k="$1"
+    ask_choice "VLESS-Vision-TLS 修改项" "" \
+        1 "修改监听端口(当前: $PORT)" \
+        2 "修改 UUID" \
+        3 "更换域名(将重新生成自签证书)" \
+        4 "重新生成自签证书" \
+        5 "修改节点名称(当前: ${NAME})"
+    [[ -z "$RESULT" ]] && return 0
+    case "$RESULT" in
+        1) ask_port "$PORT" tcp ;;
+        2) ask_valid "输入新 UUID" "$UUID" v_uuid; UUID="$RESULT" ;;
+        3)
+            ask_valid "输入新域名" "$DOMAIN" v_domain; DOMAIN="$RESULT"
+            rm -f "$SB_CERT_DIR/vless-ts.pem" "$SB_CERT_DIR/vless-ts.key"
+            gen_self_signed_cert vless-ts "$DOMAIN" >/dev/null || die "自签证书生成失败" ;;
+        4)
+            rm -f "$SB_CERT_DIR/vless-ts.pem" "$SB_CERT_DIR/vless-ts.key"
+            gen_self_signed_cert vless-ts "$DOMAIN" >/dev/null
+            warn "证书已重新生成, 自签证书客户端不校验, 无需改动客户端" ;;
+        5) ask "输入新名称" "${NAME:-$k}"; NAME="$RESULT" ;;
+    esac
+    rewrite_env "$k"
+    apply_one "$k" && print_share "$k"
+    pause
 }
 
 menu_edit_ss2022() {
@@ -1717,6 +1843,13 @@ uninstall_all() {
     uninstall_core
     rm -rf "$SB_DIR"
     ok "已彻底清除 ProxyBox 相关数据"
+    # 卸载后验证(参考 v2ray-agent): 程序/配置/进程/服务均应清除
+    local uv=1
+    [[ -f "$SB_BIN" ]] && { warn "卸载验证: $SB_BIN 仍存在"; uv=0; }
+    [[ -d "$SB_DIR" ]] && { warn "卸载验证: $SB_DIR 仍存在"; uv=0; }
+    [[ -f "$UNIT_PATH" || -f "/etc/init.d/$SERVICE_NAME" ]] && { warn "卸载验证: 服务文件仍存在"; uv=0; }
+    pgrep -x sing-box >/dev/null 2>&1 && { warn "卸载验证: 仍有 sing-box 进程运行"; uv=0; }
+    [[ "$uv" == "1" ]] && ok "卸载后验证通过: 程序/配置/服务/进程均已清除"
     return 0
 }
 
@@ -1883,9 +2016,10 @@ menu_install() {
         title "安装代理"
         printf '  %s1)%s '   "$BOLD" "$NC"; mark_installed "ss2022";   echo "Shadowsocks-2022     TCP, 抗重放强化"
         printf '  %s2)%s '   "$BOLD" "$NC"; mark_installed "hy2";      echo "Hysteria2            UDP/QUIC, 弱网提速"
-        printf '  %s3)%s '   "$BOLD" "$NC"; mark_installed "vless-rv"; echo "VLESS-Reality-Vision TCP, 最强抗封锁(推荐443)"
+        printf '  %s3)%s '   "$BOLD" "$NC"; mark_installed "vless-rv"; echo "VLESS-Reality-Vision TCP, 无域名偷站伪装(推荐443)"
         printf '  %s4)%s '   "$BOLD" "$NC"; mark_installed "vless-rg"; echo "VLESS-Reality-gRPC   TCP, 伪装+grpc传输"
-        printf '  %s5)%s '   "$BOLD" "$NC"; mark_installed "tuic";     echo "TUIC v5              UDP/QUIC, 0-RTT 低延迟"
+        printf '  %s5)%s '   "$BOLD" "$NC"; mark_installed "vless-ts"; echo "VLESS-Vision-TLS     TCP, 带域名+自签证书(兼容性最好)"
+        printf '  %s6)%s '   "$BOLD" "$NC"; mark_installed "tuic";     echo "TUIC v5              UDP/QUIC, 0-RTT 低延迟"
         echo "  ${BOLD}0)${NC} 返回上级"
         info "提示: 多个协议可同时运行互不影响; 端口规则: 同为 TCP 或同为 UDP 不可重复, TCP 与 UDP 可同号(如 Vision 用 TCP 443, Hysteria2 用 UDP 443)。"
         ask "请选择" "0"
@@ -1895,7 +2029,8 @@ menu_install() {
             2) key="hy2" ;;
             3) key="vless-rv" ;;
             4) key="vless-rg" ;;
-            5) key="tuic" ;;
+            5) key="vless-ts" ;;
+            6) key="tuic" ;;
             0|*) return 0 ;;
         esac
         if [[ -f "$SB_ENV_DIR/${key}.env" ]]; then
@@ -1910,9 +2045,10 @@ menu_install() {
             hy2)      add_hy2 ;;
             vless-rv) add_vless_rv ;;
             vless-rg) add_vless_rg ;;
+            vless-ts) add_vless_ts ;;
             tuic)     add_tuic ;;
         esac
-        if [[ "$key" == "ss2022" || "$key" == "vless-rv" || "$key" == "vless-rg" ]]; then
+        if [[ "$key" == "ss2022" || "$key" == "vless-rv" || "$key" == "vless-rg" || "$key" == "vless-ts" ]]; then
             load_env "$key"; open_port_in_firewall "$PORT" tcp
         else
             load_env "$key"; open_port_in_firewall "$PORT" udp
