@@ -776,7 +776,7 @@ cfg_body_ss2022() {
     {
       "type": "shadowsocks",
       "tag": "in-ss2022",
-      "listen": "::",
+      "listen": "$(listen_host)",
       "listen_port": ${PORT},
       "method": "${METHOD}",
       "password": "${PASSWORD}"
@@ -804,7 +804,7 @@ cfg_body_hy2() {
     {
       "type": "hysteria2",
       "tag": "in-hy2",
-      "listen": "::",
+      "listen": "$(listen_host)",
       "listen_port": ${PORT},
       "users": [
         { "password": "${PASSWORD}" }
@@ -830,7 +830,7 @@ cfg_body_tuic() {
     {
       "type": "tuic",
       "tag": "in-tuic",
-      "listen": "::",
+      "listen": "$(listen_host)",
       "listen_port": ${PORT},
       "users": [
         { "uuid": "${UUID}", "password": "${PASSWORD}" }
@@ -855,7 +855,7 @@ cfg_body_vless_rv() {
     {
       "type": "vless",
       "tag": "in-vless-rv",
-      "listen": "::",
+      "listen": "$(listen_host)",
       "listen_port": ${PORT},
       "users": [
         { "uuid": "${UUID}", "flow": "xtls-rprx-vision" }
@@ -882,7 +882,7 @@ cfg_body_vless_rg() {
     {
       "type": "vless",
       "tag": "in-vless-rg",
-      "listen": "::",
+      "listen": "$(listen_host)",
       "listen_port": ${PORT},
       "users": [
         { "uuid": "${UUID}" }
@@ -914,7 +914,7 @@ cfg_body_vless_ts() {
     {
       "type": "vless",
       "tag": "in-vless-ts",
-      "listen": "::",
+      "listen": "$(listen_host)",
       "listen_port": ${PORT},
       "users": [
         { "uuid": "${UUID}", "flow": "xtls-rprx-vision" }
@@ -1436,8 +1436,17 @@ cleanup_orphan_configs() {
 }
 
 # 安装/修改后验证(参考 v2ray-agent 的安装后校验): 服务活跃 + 端口监听
+# 监听地址: IPv6 可用用 ::(双栈), 否则退回 0.0.0.0 (Incus/LXC 等无 IPv6 容器必配)
+listen_host() {
+    if [[ -s /proc/net/if_inet6 ]]; then
+        echo "::"
+    else
+        echo "0.0.0.0"
+    fi
+}
+
 verify_installed() {
-    local k="$1" port scheme
+    local k="$1" port scheme i
     port="$(grep -E '^PORT=' "$SB_ENV_DIR/$k.env" 2>/dev/null | head -n1 | cut -d= -f2 | tr -d "'\"")"
     [[ -z "$port" ]] && return 0
     if ! svc_active; then
@@ -1445,12 +1454,17 @@ verify_installed() {
         return 1
     fi
     scheme="tcp"; case "$k" in hy2|tuic) scheme="udp" ;; esac
-    if port_in_use "$port" "$scheme"; then
-        ok "安装后验证通过: 服务运行中, $scheme 端口 $port 正在监听"
-    else
-        warn "安装后验证: $scheme 端口 $port 未监听! 配置可能未生效, 请查看日志。"
-        return 1
-    fi
+    # 重试 3 次(每次间隔 1 秒), 避免 sing-box 尚未完成绑定就误报
+    for i in 1 2 3; do
+        if port_in_use "$port" "$scheme"; then
+            ok "安装后验证通过: 服务运行中, $scheme 端口 $port 正在监听"
+            return 0
+        fi
+        sleep 1
+    done
+    warn "安装后验证: $scheme 端口 $port 未监听! 日志最后几行如下:"
+    svc_log_tail 8 | sed 's/^/    /'
+    return 1
 }
 
 apply_one() {
