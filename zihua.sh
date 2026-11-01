@@ -2438,22 +2438,41 @@ ver_gt() {
     return 1
 }
 
-# 下载最新脚本到 $1 (多通道: raw → gh-proxy → ghfast), 成功返回 0
-download_latest_script() {
-    local out="$1" u okdl=0
+# 逐通道尝试下载最新脚本到 $1: raw → gh-proxy → ghfast → jsdelivr 三节点
+#   $2=verbose(yes 时逐通道打印失败原因)  $3=最多尝试通道数(0=全部)
+# 可用环境变量覆盖超时: DL_CONNECT_TIMEOUT(默认8) / DL_MAX_TIME(默认60)
+# 成功: UPDATE_CHANNEL=通道名, 返回0; 全部失败: 返回1
+try_update_channels() {
+    local out="$1" verbose="${2:-no}" limit="${3:-0}" u name n=0
     [[ "$(command -v curl || true)" == "" ]] && return 1
-    while IFS= read -r u; do
-        [[ -z "$u" ]] && continue
-        if curl -fsSL --connect-timeout 6 --max-time 60 -o "$out" "$u" 2>/dev/null \
-           && [[ -s "$out" ]] && head -n5 "$out" | grep -q "zihua.sh\|PROXYBOX_VERSION"; then
-            okdl=1; break
+    local ct="${DL_CONNECT_TIMEOUT:-8}" mt="${DL_MAX_TIME:-60}"
+    UPDATE_CHANNEL=""
+    while IFS='|' read -r name u; do
+        [[ -z "$name" || -z "$u" ]] && continue
+        (( limit > 0 && n >= limit )) && break
+        n=$((n+1))
+        if curl -fsSL --connect-timeout "$ct" --max-time "$mt" -o "$out" "$u" 2>/dev/null \
+           && [[ -s "$out" ]] && grep -q 'PROXYBOX_VERSION="[0-9]' "$out"; then
+            UPDATE_CHANNEL="$name"
+            return 0
         fi
+        [[ "$verbose" == "yes" ]] && warn "  通道 [$name] 下载失败或内容异常"
     done <<EOF
-$SELF_REPO_RAW
-https://gh-proxy.com/$SELF_REPO_RAW
-https://ghfast.top/$SELF_REPO_RAW
+raw|$SELF_REPO_RAW
+gh-proxy|https://gh-proxy.com/$SELF_REPO_RAW
+ghfast|https://ghfast.top/$SELF_REPO_RAW
+jsdelivr|https://cdn.jsdelivr.net/gh/xiaoluaibb/zihua@main/zihua.sh
+fastly|https://fastly.jsdelivr.net/gh/xiaoluaibb/zihua@main/zihua.sh
+testingcf|https://testingcf.jsdelivr.net/gh/xiaoluaibb/zihua@main/zihua.sh
 EOF
-    [[ "$okdl" == "1" ]] || { rm -f "$out"; return 1; }
+    rm -f "$out"
+    return 1
+}
+
+# 下载最新脚本到 $1 并做安全校验(语法合法 + 带版本号), 成功返回 0
+download_latest_script() {
+    local out="$1"
+    try_update_channels "$out" "${2:-no}" "${3:-0}" || return 1
     # 下载内容必须语法合法且带版本号, 防止镜像返回错误页
     bash -n "$out" 2>/dev/null || { rm -f "$out"; return 1; }
     grep -q 'PROXYBOX_VERSION="[0-9]' "$out" || { rm -f "$out"; return 1; }
@@ -2464,7 +2483,7 @@ EOF
 fetch_remote_version() {
     local tmp="$SB_BAK_DIR/.latest.sh"
     mkdir -p "$SB_BAK_DIR" 2>/dev/null
-    download_latest_script "$tmp" || { rm -f "$tmp"; return 1; }
+    download_latest_script "$tmp" "${2:-no}" "${3:-0}" || { rm -f "$tmp"; return 1; }
     grep -m1 'PROXYBOX_VERSION=' "$tmp" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+'
 }
 
@@ -2489,12 +2508,12 @@ do_self_update() {
     fi
 }
 
-# 启动时静默检测(不阻塞, 失败不打扰): 有新版才询问
+# 启动时静默检测(失败不打扰): 只试前 2 个通道且超时收紧, 避免阻塞进入菜单; 有新版才询问
 startup_update_check() {
     [[ "${ZIHUA_NO_UPDATE_CHECK:-0}" == "1" ]] && return 0
     command -v curl >/dev/null 2>&1 || return 0
     local rv
-    rv="$(fetch_remote_version)" || return 0
+    rv="$(DL_CONNECT_TIMEOUT=3 DL_MAX_TIME=8 fetch_remote_version "" no 2)" || return 0
     [[ -z "$rv" ]] && return 0
     if ver_gt "$rv" "$PROXYBOX_VERSION"; then
         hr
@@ -2513,19 +2532,26 @@ startup_update_check() {
 menu_update() {
     title "检查更新"
     info "当前版本: v$PROXYBOX_VERSION"
-    info "正在检测远端最新版本(raw → gh-proxy → ghfast 多通道)..."
-    local rv
-    if ! rv="$(fetch_remote_version)" || [[ -z "$rv" ]]; then
-        err "检测失败: 无法连接 GitHub(所有通道均超时)。请检查服务器网络后重试。"
+    info "正在检测远端最新版本(raw → gh-proxy → ghfast → jsdelivr 多通道)..."
+    local rv tmp="$SB_BAK_DIR/.latest.sh"
+    mkdir -p "$SB_BAK_DIR" 2>/dev/null
+    if ! download_latest_script "$tmp" yes; then
+        err "检测失败: 所有下载通道均不可达。"
+        info "排查建议: 在服务器上执行以下命令测试各通道连通性 ——"
+        echo "    ${GRAY}curl -fsSL --connect-timeout 8 -o /dev/null -w '%{http_code}\n' $SELF_REPO_RAW${NC}"
+        echo "    ${GRAY}curl -fsSL --connect-timeout 8 -o /dev/null -w '%{http_code}\n' https://cdn.jsdelivr.net/gh/xiaoluaibb/zihua@main/zihua.sh${NC}"
+        info "哪个通道返回 200 就用哪个手动下载: wget -O /root/zihua.sh <对应地址>"
         pause; return
     fi
-    info "远端版本: v$rv"
+    rv="$(grep -m1 'PROXYBOX_VERSION=' "$tmp" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
+    info "下载通道: $UPDATE_CHANNEL  远端版本: v${rv:-未知}"
     if ver_gt "$rv" "$PROXYBOX_VERSION"; then
         warn "有可用更新: v$PROXYBOX_VERSION → v$rv"
         ask "是否立即更新? [Y/n]" "y"
         [[ "$RESULT" =~ ^[yY]([eE][sS])?$ ]] && do_self_update "$rv"
     else
         ok "当前已是最新版本 v$PROXYBOX_VERSION"
+        rm -f "$tmp"
     fi
     pause
 }
