@@ -12,11 +12,11 @@
 #             三个服务独立管理, 可同时运行, UDP/TCP 端口互不冲突
 #  多协议   : 各协议独立实例+独立证书, TCP/UDP 端口可复用, 可同时运行
 #  附加功能 : 一键重装系统 (调用同仓库 reinstall-vm.sh, 支持 KVM/LXC)
-#  版本     : v1.6.2  (2026-11)
+#  版本     : v1.6.3  (2026-11)
 #===============================================================================
 
 #--------------------------------- 全局变量 ------------------------------------
-PROXYBOX_VERSION="1.6.2"
+PROXYBOX_VERSION="1.6.3"
 SB_BIN="/usr/local/bin/sing-box"
 SB_DIR="/etc/sing-box"
 SB_ENV_DIR="$SB_DIR/instance.d"          # 每个协议一份参数(env)
@@ -2020,7 +2020,17 @@ add_hy2() {
         if [[ -f "/etc/systemd/system/${HY3_SERVICE}.service" ]]; then
             pkill -f "${HY3_DIR}/hysteria" >/dev/null 2>&1
             sleep 1
-            hysvc_restart >/dev/null 2>&1 && ok "已交给 systemd 托管并重启($HY3_SERVICE), 开机自启已生效"
+            hysvc_restart >/dev/null 2>&1
+            sleep 2
+            if hysvc_active; then
+                ok "已交给 systemd 托管($HY3_SERVICE), 开机自启已生效"
+            else
+                err "systemd 接管失败: $HY3_SERVICE 起不来(它的 nohup 进程已被停掉, 现在没有服务在跑)"
+                info "取证如下:"
+                hy_unit_forensics
+                ask "尝试自动修复服务单元? [Y/n]" "y"
+                [[ ! "$RESULT" =~ ^[nN]$ ]] && hy_unit_repair
+            fi
         fi
         # 第三方脚本不管本机防火墙, 这里补放行(漏了就是"服务在跑但客户端超时")
         load_env hy2
@@ -3347,6 +3357,91 @@ menu_install() {
 
 #----------------------------- Hysteria2 连通性自检 --------------------------------
 # 客户端超时但服务端日志毫无反应时, 用它判断卡在 进程/监听/NAT/防火墙/安全组 哪一段
+# 重写服务单元: 显式给绝对配置路径 + 工作目录, 修 "WorkingDirectory 失效/找不到 config.yaml" 导致的秒退
+hy_unit_repair() {
+    local unit bin wd
+    [[ "$INIT_SYS" == "systemd" ]] || { warn "非 systemd 系统, 不走这条路"; return 1; }
+    unit="$(hy2_unit)"
+    bin="$(awk -F'ExecStart=' '/^ExecStart=/{print $2}' "/etc/systemd/system/${unit}.service" 2>/dev/null | awk '{print $1}')"
+    wd="$(awk -F'WorkingDirectory=' '/^WorkingDirectory=/{print $2}' "/etc/systemd/system/${unit}.service" 2>/dev/null | head -n1)"
+    [[ -z "$wd" ]] && wd="$HY3_DIR"
+    wd="${wd%/}"
+    [[ -z "$bin" ]] && bin="$wd/hysteria-linux-$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"
+    if [[ ! -x "$bin" ]]; then err "找不到可执行文件($bin), 无法自动修复"; return 1; fi
+    if [[ ! -f "$wd/config.yaml" ]]; then err "找不到 $wd/config.yaml, 无法自动修复"; return 1; fi
+    info "重写 /etc/systemd/system/${unit}.service (显式 -c 绝对路径)..."
+    cat > "/etc/systemd/system/${unit}.service" <<UNIT
+[Unit]
+Description=Hysteria2 Server (managed by ProxyBox)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$wd
+ExecStart=$bin server -c $wd/config.yaml
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload >/dev/null 2>&1
+    systemctl reset-failed "$unit" >/dev/null 2>&1
+    systemctl enable "$unit" >/dev/null 2>&1
+    systemctl restart "$unit"
+    sleep 2
+    if hysvc_active; then
+        ok "服务单元已重写并启动成功($unit)"
+        return 0
+    fi
+    err "仍然起不来, 下面是真实报错:"
+    hy_unit_forensics
+    return 1
+}
+
+# Hysteria2 服务起不来(秒退)时的取证: 服务状态 + 程序自身报错 + 前台试跑 + 配置文件肉眼可见
+hy_unit_forensics() {
+    local unit bin wd cfg
+    unit="$(hy2_unit)"
+    if [[ "$INIT_SYS" == "systemd" ]]; then
+        printf '   %s\n' "$(systemctl status "$unit" --no-pager -l 2>/dev/null | head -n 8 | sed 's/^/   /')"
+        # 程序自身的报错(systemd 那几条模板消息没有信息量, 过滤掉)
+        local raw
+        raw="$(journalctl -u "$unit" -n 60 --no-pager 2>/dev/null \
+              | grep -viE 'systemd\[1\]|Started |Stopping |Stopped |Scheduled restart|Failed with result|Main process exited|Start request repeated|Failed to start|Consumed |^-- ' \
+              | tail -n 8)"
+        if [[ -n "$raw" ]]; then
+            printf '   程序自身报错:\n'
+            printf '%s\n' "$raw" | sed 's/^/      /'
+        else
+            printf '   日志里没有程序自己的报错(说明它在输出任何东西之前就退出了)\n'
+        fi
+        bin="$(awk -F'ExecStart=' '/^ExecStart=/{print $2}' "/etc/systemd/system/${unit}.service" 2>/dev/null | awk '{print $1}')"
+        wd="$(awk -F'WorkingDirectory=' '/^WorkingDirectory=/{print $2}' "/etc/systemd/system/${unit}.service" 2>/dev/null | head -n1)"
+    else
+        bin="$HY_BIN"
+    fi
+    [[ -z "$wd" ]] && wd="$(dirname "${bin:-/root/hy3/x}")"
+    cfg="$wd/config.yaml"; cfg="${cfg//\/\//\/}"
+    printf '   可执行文件: %s\n' "${bin:-未找到}"
+    [[ -n "$bin" && -e "$bin" ]] && printf '   文件信息: %s\n' "$(ls -l "$bin" 2>/dev/null)"
+    printf '   配置文件: %s\n' "$cfg"
+    if [[ -f "$cfg" ]]; then
+        printf '   前 8 行(^I 代表制表符, YAML 不允许用制表符缩进, 出现 ^I 就是配置坏了):\n'
+        head -n 8 "$cfg" 2>/dev/null | cat -A | sed 's/^/      /'
+    else
+        printf '   (配置文件不存在)\n'
+    fi
+    # 前台直接跑 5 秒, 它会自己把 fatal 原因打出来
+    if [[ -x "$bin" ]] && command -v timeout >/dev/null 2>&1; then
+        printf '   前台试跑(最多 5 秒, 正常的话会看到 server up and running):\n'
+        ( cd "$wd" 2>/dev/null && timeout 5 "$bin" server 2>&1 | head -n 12 ) | sed 's/^/      /'
+    fi
+    return 0
+}
+
 hy_diagnose() {
     title "Hysteria2 连通性自检"
     if [[ ! -f "$SB_ENV_DIR/hy2.env" ]]; then
@@ -3367,6 +3462,12 @@ hy_diagnose() {
         ok "$unit 运行中"
     else
         err "$unit 未运行, 先到『启动/停止/重启/状态』里启动"
+        info "自动取证(不用你另外敲命令):"
+        hy_unit_forensics
+        if [[ "$INIT_SYS" == "systemd" ]]; then
+            ask "尝试自动修复服务单元(重写 unit, 显式指定配置文件路径)? [Y/n]" "y"
+            [[ ! "$RESULT" =~ ^[nN]$ ]] && hy_unit_repair
+        fi
     fi
     ll="$(ss -H -lunp 2>/dev/null | grep -E "[:.]${port}[[:space:]]" | head -n1)"
     if [[ -n "$ll" ]]; then
