@@ -38,19 +38,19 @@ bash zihua.sh
 
 ## 功能简介
 
-- 三内核架构（v1.5.0 起）：
+- 三内核架构（v1.5.0 起，v1.6.0 调整 Hysteria2 安装方式）：
   - sing-box：SS2022 / TUIC / VLESS-Vision-TLS（自签证书）
   - Xray：VLESS-Reality-Vision / VLESS-Reality-gRPC（配置与 v2ray-agent 同款模板，独立服务 zihua-xray，抗封锁首选）
-  - hysteria 官方内核：Hysteria2（独立服务 zihua-hy2，配置文件 `/etc/sing-box/hysteria/config.yaml`，方案与 seagullz4/hysteria2 一致）
+  - hysteria 官方内核：Hysteria2 —— **安装/卸载直接调用 [seagullz4/hysteria2](https://github.com/seagullz4/hysteria2) 的 install.sh**（作者 seagullz4，感谢），本脚本只负责下载、调用与结果展示
   - 三个服务彼此独立，只重启自己那份；装/改/删 Hysteria2 不会影响 SS2022 与 Reality
 - 多协议同时运行：各协议独立实例与独立证书，TCP 与 UDP 端口可同号并存（如 Vision 用 TCP 443，Hysteria2 用 UDP 443）
 - Reality 偷域名：内置大厂域名可选（也可偷自己的域名），选择后自动测试目标是否支持 TLS1.3，并检测 Cloudflare CDN 代理（套 CDN 的域名会被警告，防止 VPS 流量被滥用）
 - 安装后自动验证：服务运行状态 + 端口监听检查；卸载后自动验证程序 / 配置 / 进程清除干净
-- TLS 证书三种来源（Hysteria2 / TUIC）：
+- TLS 证书三种来源（TUIC）：
   1. 自签证书：无域名一键生成，客户端开『允许不安全』
   2. 已有证书文件：填 acme.sh / certbot / 宝塔 签发的 pem + key 路径
-  3. 自动申请：Hysteria2 用官方内核内置 ACME（域名解析到本机 + 443 端口空闲即可，证书由 hysteria 自己申请与续期，不需要 acme.sh、不需要 80 端口）；TUIC 仍用 acme.sh
-- Hysteria2 附加选项：自定义伪装网址（masquerade 反代）、端口跳跃（iptables DNAT，客户端链接自动带 `mport`）、官方内核在线更新
+  3. acme.sh 自动申请（域名解析到本机即可）
+- Hysteria2 的证书/端口/密码/伪装/端口跳跃，全部由第三方脚本问询，参数与它自己的安装完全一致
 - 交互式菜单：安装、新增 / 修改 / 删除协议实例、查看配置
 - 系统兼容：systemd 与 OpenRC 双支持（Alpine 原生可用，无需 systemd）
 - 快捷命令：首次运行后自动安装 `zihua` 命令，以后直接输入 `zihua` 即可再次打开
@@ -74,13 +74,18 @@ bash zihua.sh
 
 ## Hysteria2 说明
 
+Hysteria2 部分**直接调用第三方脚本** [seagullz4/hysteria2](https://github.com/seagullz4/hysteria2) 完成，安装流程、交互选项、配置写法与它自己一键安装完全一致。感谢原作者 seagullz4。
+
 | 项目 | 说明 |
 |------|------|
-| 内核 | 官方 `hysteria`（`/usr/local/bin/hysteria`），自动从 download.hysteria.network 下载，失败回退 GitHub 与镜像 |
-| 服务 | systemd `zihua-hy2.service` / OpenRC `zihua-hy2`，日志 `journalctl -u zihua-hy2` 或 `/var/log/zihua-hy2.log` |
-| 配置 | `/etc/sing-box/hysteria/config.yaml` |
-| 端口 | 默认 UDP 443（ACME 方式必须是 443）；与 TCP 443 的 Reality 可以同号共存 |
-| 排查 | 『代理管理 → Hysteria2 连通性自检』一键查 进程/监听/NAT/防火墙/是否收到过客户端数据，并给出结论；『查看运行日志』里有 Hysteria2 独立日志段 |
+| 安装 | 菜单选 Hysteria2 → 自动下载它的 install.sh 到 `/usr/local/bin/hy2-install.sh` 并执行，选 1 安装；四个下载通道（jsdelivr / raw / ghfast / gh-proxy）任一可用即可 |
+| 内核 | 官方 `hysteria`，由第三方脚本下载（`/root/hy3/hysteria-linux-<arch>`） |
+| 服务 | systemd `hysteria.service`（第三方脚本创建），日志 `journalctl -u hysteria` |
+| 配置 | `/root/hy3/config.yaml` |
+| 端口 | 第三方脚本里填，默认 UDP 443；与 TCP 443 的 Reality 可以同号共存 |
+| 接入本脚本 | 安装完自动反解 `config.yaml`（端口 / 密码 / 证书方式 / SNI / 端口跳跃范围），生成 `hy2://` 分享链接，并在代理列表里显示运行状态 |
+| 删除 | 『删除某个代理』会按第三方脚本的卸载逻辑清理 `hysteria` / `ipppp`，不碰 SS2022 与 Reality |
+| 排查 | 『代理管理 → Hysteria2 连通性自检』一键查 进程/监听/NAT/防火墙/是否收到过客户端数据，并给出结论 |
 
 ## 常见问题
 
