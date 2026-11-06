@@ -80,7 +80,7 @@ bash zihua.sh
 | 服务 | systemd `zihua-hy2.service` / OpenRC `zihua-hy2`，日志 `journalctl -u zihua-hy2` 或 `/var/log/zihua-hy2.log` |
 | 配置 | `/etc/sing-box/hysteria/config.yaml` |
 | 端口 | 默认 UDP 443（ACME 方式必须是 443）；与 TCP 443 的 Reality 可以同号共存 |
-| 排查 | 『代理管理 → 查看运行日志』里有 Hysteria2 独立日志段；客户端连不上时先看这里有没有握手记录 |
+| 排查 | 『代理管理 → Hysteria2 连通性自检』一键查 进程/监听/NAT/防火墙/是否收到过客户端数据，并给出结论；『查看运行日志』里有 Hysteria2 独立日志段 |
 
 ## 常见问题
 
