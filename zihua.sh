@@ -6,16 +6,17 @@
 #             Fedora / Alpine 3.15+ / Arch  (systemd 或 OpenRC 均可)
 #  运行方式 : 以 root 运行   bash zihua.sh   (root 下直接运行即可, 无需 sudo)
 #  快捷命令 : 首次运行后自动安装 zihua 命令, 以后直接输入 zihua 即可再次打开
-#  双内核   : sing-box (SS2022 / Hysteria2 / TUIC)
+#  三内核   : sing-box (SS2022 / TUIC)
 #             Xray (VLESS-Reality-Vision / gRPC, 配置与 v2ray-agent 同款)
-#             两个服务独立管理, 可同时运行
+#             hysteria 官方内核 (Hysteria2, 与 seagullz4/hysteria2 同方案)
+#             三个服务独立管理, 可同时运行, UDP/TCP 端口互不冲突
 #  多协议   : 各协议独立实例+独立证书, TCP/UDP 端口可复用, 可同时运行
 #  附加功能 : 一键重装系统 (调用同仓库 reinstall-vm.sh, 支持 KVM/LXC)
-#  版本     : v1.3.0  (2026-11)
+#  版本     : v1.5.0  (2026-11)
 #===============================================================================
 
 #--------------------------------- 全局变量 ------------------------------------
-PROXYBOX_VERSION="1.4.9"
+PROXYBOX_VERSION="1.5.0"
 SB_BIN="/usr/local/bin/sing-box"
 SB_DIR="/etc/sing-box"
 SB_ENV_DIR="$SB_DIR/instance.d"          # 每个协议一份参数(env)
@@ -31,6 +32,12 @@ XRAY_LOG_FILE="/var/log/zihua-xray.log"
 # (X25519MLKEM768), 旧版 sing-box/Mihomo 等客户端不带该扩展 → reality verification failed。
 # v26.7.11 起又默认启用 minClientVer 拒绝旧客户端, 故固定在 v26.6.27 (无这两个坑)。
 XRAY_PIN_VER="v26.6.27"
+# Hysteria2: 用官方 hysteria 内核(与 seagullz4/hysteria2 脚本同方案), 独立服务, 与 sing-box/Xray 并存
+HY_BIN="/usr/local/bin/hysteria"
+HY_DIR="/etc/sing-box/hysteria"
+HY_CFG="$HY_DIR/config.yaml"
+HY_SERVICE="zihua-hy2"
+HY_LOG_FILE="/var/log/zihua-hy2.log"
 UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 SYSCTL_FILE="/etc/sysctl.d/99-proxybox-optimize.conf"
 SYSCTL_BAK="/etc/sysctl.d/proxybox-optimize.orig"   # 调优前原值备份(无 .conf 后缀, 不会被 sysctl 加载)
@@ -381,7 +388,7 @@ check_proxy_conflicts() {
     fi
     # 进程级兜底检查(排除本脚本管理的 sing-box/Xray 进程, 避免把自己当成冲突代理)
     local own_pids
-    own_pids=" $(svc_own_pids) $(command -v "$XRAY_BIN" >/dev/null 2>&1 && xsvc_own_pids) "
+    own_pids=" $(svc_own_pids) $(command -v "$XRAY_BIN" >/dev/null 2>&1 && xsvc_own_pids) $(command -v "$HY_BIN" >/dev/null 2>&1 && hysvc_own_pids) "
     for pn in $(pgrep -d' ' -f "${pat}" 2>/dev/null); do
         [[ "$own_pids" == *" $pn "* ]] && continue
         pname=$(ps -o comm= -p "$pn" 2>/dev/null | head -n1)
@@ -638,10 +645,28 @@ svc_restart() {
 
 #------------------------- Xray 内核 (Reality 协议专用, v2ray-agent 同款) -------------------------
 # 内核路由: Reality 协议走 Xray, 其余走 sing-box
-proto_kernel() { case "$1" in vless-rv|vless-rg) echo xray ;; *) echo sing-box ;; esac; }
-kernel_active() { if [[ "$(proto_kernel "$1")" == "xray" ]]; then xsvc_active; else svc_active; fi; }
-# 按协议所属内核打印日志尾部(避免 Xray 协议去 tail sing-box 的日志, 看不到真实报错)
-kernel_log_tail() { if [[ "$(proto_kernel "$1")" == "xray" ]]; then xsvc_log_tail "${2:-20}"; else svc_log_tail "${2:-20}"; fi; }
+proto_kernel() {
+    case "$1" in
+        vless-rv|vless-rg) echo xray ;;
+        hy2)               echo hysteria ;;
+        *)                 echo sing-box ;;
+    esac
+}
+kernel_active() {
+    case "$(proto_kernel "$1")" in
+        xray)     xsvc_active ;;
+        hysteria) hysvc_active ;;
+        *)        svc_active ;;
+    esac
+}
+# 按协议所属内核打印日志尾部(避免 Xray/Hysteria 协议去 tail sing-box 的日志, 看不到真实报错)
+kernel_log_tail() {
+    case "$(proto_kernel "$1")" in
+        xray)     xsvc_log_tail "${2:-20}" ;;
+        hysteria) hysvc_log_tail "${2:-20}" ;;
+        *)        svc_log_tail "${2:-20}" ;;
+    esac
+}
 
 xray_download_urls() {
     local fname
@@ -761,6 +786,285 @@ xsvc_active()   { if [[ "$INIT_SYS" == "systemd" ]]; then systemctl is-active --
 xsvc_stop_now() { if [[ "$INIT_SYS" == "systemd" ]]; then systemctl disable --now "$XRAY_SERVICE" >/dev/null 2>&1; else rc-service "$XRAY_SERVICE" stop >/dev/null 2>&1; rc-update del "$XRAY_SERVICE" default >/dev/null 2>&1; fi; }
 xsvc_log_tail() { if [[ "$INIT_SYS" == "systemd" ]]; then journalctl -u "$XRAY_SERVICE" -n "${1:-60}" --no-pager -e 2>/dev/null; else tail -n "${1:-60}" "$XRAY_LOG_FILE" 2>/dev/null; fi; }
 xsvc_own_pids() { pgrep -f "xray run -config ${XRAY_CFG}" 2>/dev/null | tr '\n' ' '; }
+
+#--------------------------------- Hysteria2 内核 (官方 hysteria) ------------------
+# 方案对照 seagullz4/hysteria2: 独立二进制 + YAML 配置 + 独立服务, 与 sing-box / Xray 并存互不干扰。
+# 之前用 sing-box 的 hysteria2 入站, 客户端连不上时服务端日志无任何记录; 换成官方内核后一致。
+hy_arch() {
+    case "$ARCH" in
+        amd64) echo amd64 ;;
+        arm64) echo arm64 ;;
+        armv7) echo arm ;;
+        *)     return 1 ;;
+    esac
+}
+
+hysteria_download_urls() {
+    local a
+    a="$(hy_arch)" || return 1
+    local gh="https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${a}"
+    echo "https://download.hysteria.network/app/latest/hysteria-linux-${a}"
+    echo "$gh"
+    echo "https://gh-proxy.com/${gh}"
+    echo "https://ghfast.top/${gh}"
+}
+
+install_hysteria() {
+    ensure_dirs
+    title "Hysteria2 内核安装 (官方 hysteria)"
+    local a url okdl=0 tmp
+    a="$(hy_arch)" || die "不支持的 CPU 架构: $(uname -m), 官方 hysteria 无对应二进制。"
+    tmp="$(mktemp -d)" || die "创建临时目录失败"
+    while IFS= read -r url; do
+        [[ -z "$url" ]] && continue
+        printf '%s    下载: %s%s\n' "$GRAY" "$url" "$NC"
+        if curl -fSL --connect-timeout 8 --max-time 300 -o "$tmp/hysteria" "$url" 2>/dev/null && [[ -s "$tmp/hysteria" ]]; then
+            okdl=1; break
+        fi
+        warn "该地址下载失败，切换备用地址..."
+    done < <(hysteria_download_urls)
+    [[ "$okdl" != "1" ]] && { rm -rf "$tmp"; die "hysteria 下载失败(所有地址均不可达)。"; }
+    install -m 0755 "$tmp/hysteria" "$HY_BIN"
+    rm -rf "$tmp"
+    if ! "$HY_BIN" version >/dev/null 2>&1; then
+        die "hysteria 已下载但无法运行, 请检查系统兼容性。"
+    fi
+    ok "Hysteria2 安装完成: $("$HY_BIN" version 2>/dev/null | head -n1)"
+}
+
+ensure_hy_core() {
+    if [[ -x "$HY_BIN" ]] && "$HY_BIN" version >/dev/null 2>&1; then return 0; fi
+    install_hysteria
+}
+
+update_hy_core() {
+    title "更新 Hysteria2 内核"
+    if [[ ! -x "$HY_BIN" ]]; then info "尚未安装 Hysteria2 内核, 无需更新"; return 0; fi
+    local old new
+    old="$("$HY_BIN" version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
+    install_hysteria || return 1
+    new="$("$HY_BIN" version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
+    if [[ -n "$old" && "$old" == "$new" ]]; then
+        ok "已是最新版本 ($new)"
+    else
+        ok "已更新: ${old:-未知} → ${new:-未知}"
+        [[ -f "$HY_CFG" ]] && hysvc_restart && ok "Hysteria2 服务已重启"
+    fi
+}
+
+hy_ensure_service() {
+    if [[ "$INIT_SYS" == "openrc" ]] && [[ -x "/etc/init.d/${HY_SERVICE}" ]]; then return 0; fi
+    if [[ "$INIT_SYS" == "systemd" ]] && [[ -f "/etc/systemd/system/${HY_SERVICE}.service" ]]; then return 0; fi
+    if [[ "$INIT_SYS" == "openrc" ]]; then
+        cat > "/etc/init.d/${HY_SERVICE}" <<UNIT
+#!/sbin/openrc-run
+description="ProxyBox Hysteria2 server"
+command="${HY_BIN}"
+command_args="server -c ${HY_CFG}"
+command_background="yes"
+pidfile="/run/${HY_SERVICE}.pid"
+output_log="${HY_LOG_FILE}"
+error_log="${HY_LOG_FILE}"
+depend() {
+    need net
+    use dns
+}
+UNIT
+        chmod +x "/etc/init.d/${HY_SERVICE}"
+    else
+        cat > "/etc/systemd/system/${HY_SERVICE}.service" <<UNIT
+[Unit]
+Description=ProxyBox Hysteria2 server
+After=network.target nss-lookup.target
+
+[Service]
+Type=simple
+ExecStart=${HY_BIN} server -c ${HY_CFG}
+WorkingDirectory=${HY_DIR}
+Restart=on-failure
+RestartSec=3s
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+        systemctl daemon-reload
+    fi
+    if [[ "$INIT_SYS" == "systemd" ]]; then
+        systemctl enable "$HY_SERVICE" >/dev/null 2>&1
+    else
+        rc-update add "$HY_SERVICE" default >/dev/null 2>&1
+    fi
+    ok "已创建并启用 Hysteria2 服务: $HY_SERVICE"
+}
+
+hysvc_restart()  { if [[ "$INIT_SYS" == "systemd" ]]; then systemctl restart "$HY_SERVICE"; else rc-service "$HY_SERVICE" restart; fi; }
+hysvc_active()   { if [[ "$INIT_SYS" == "systemd" ]]; then systemctl is-active --quiet "$HY_SERVICE" 2>/dev/null; else rc-service "$HY_SERVICE" status >/dev/null 2>&1; fi; }
+hysvc_stop_now() { if [[ "$INIT_SYS" == "systemd" ]]; then systemctl disable --now "$HY_SERVICE" >/dev/null 2>&1; else rc-service "$HY_SERVICE" stop >/dev/null 2>&1; rc-update del "$HY_SERVICE" default >/dev/null 2>&1; fi; }
+hysvc_log_tail() { if [[ "$INIT_SYS" == "systemd" ]]; then journalctl -u "$HY_SERVICE" -n "${1:-60}" --no-pager -e 2>/dev/null; else tail -n "${1:-60}" "$HY_LOG_FILE" 2>/dev/null; fi; }
+hysvc_own_pids() { pgrep -f "hysteria server -c ${HY_CFG}" 2>/dev/null | tr '\n' ' '; }
+
+# 生成 config.yaml (字段与官方文档一致: listen / tls 或 acme / auth / masquerade / bandwidth)
+hy_gen_config() {
+    load_env hy2
+    mkdir -p "$HY_DIR"
+    local cert="" key=""
+    case "$CERT_MODE" in
+        acme)
+            if [[ -z "$DOMAIN" ]]; then err "ACME 方式缺少域名"; return 1; fi ;;
+        manual)
+            if [[ ! -r "$CERT_FILE" || ! -r "$KEY_FILE" ]]; then
+                err "证书文件不可读: cert=$CERT_FILE key=$KEY_FILE"; return 1
+            fi
+            cert="$CERT_FILE"; key="$KEY_FILE" ;;
+        *)
+            cert="$SB_CERT_DIR/hy2.pem"; key="$SB_CERT_DIR/hy2.key"
+            if [[ ! -f "$cert" || ! -f "$key" ]]; then
+                gen_self_signed_cert hy2 "${DOMAIN:-bing.com}" >/dev/null || { err "自签证书生成失败"; return 1; }
+            fi ;;
+    esac
+    {
+        printf 'listen: :%s\n\n' "$PORT"
+        if [[ "$CERT_MODE" == "acme" ]]; then
+            printf 'acme:\n  domains:\n    - %s\n  email: %s\n\n' "$DOMAIN" "${ACME_EMAIL:-proxybox@$(printf '%s' "$DOMAIN" | sed 's/^[^.]*\.//')}"
+        else
+            printf 'tls:\n  cert: %s\n  key: %s\n\n' "$cert" "$key"
+        fi
+        printf 'auth:\n  type: password\n  password: %s\n\n' "$PASSWORD"
+        printf 'masquerade:\n  type: proxy\n  proxy:\n    url: "%s"\n    rewriteHost: true\n\n' "${MASQ:-https://news.ycombinator.com/}"
+        printf 'bandwidth:\n  up: 0 gbps\n  down: 0 gbps\n\n'
+        printf 'udpIdleTimeout: 90s\n'
+    } > "$HY_CFG" 2>/dev/null || { err "写入 $HY_CFG 失败"; return 1; }
+    chmod 600 "$HY_CFG"
+    ok "Hysteria2 配置已生成: $HY_CFG"
+    return 0
+}
+
+# 端口跳跃(iptables DNAT, 可选): 与参考脚本一致, 规则持久化到独立 oneshot 服务
+hy_hop_clean() {
+    command -v iptables >/dev/null 2>&1 || return 0
+    local i
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        iptables -t nat -D PREROUTING -p udp --dport "$1":"$2" -j DNAT --to-destination ":$3" >/dev/null 2>&1 || break
+    done
+    return 0
+}
+
+hy_hop_apply() {
+    if [[ -z "${HOP_START:-}" || -z "${HOP_END:-}" ]]; then
+        # 关闭端口跳跃: 清掉旧规则与持久化脚本/服务
+        if [[ -f "$HY_DIR/port-hop.sh" ]]; then
+            local ps pe
+            ps="$(sed -n 's/.*--dport \([0-9]*\):\([0-9]*\).*/\1/p' "$HY_DIR/port-hop.sh" | head -n1)"
+            pe="$(sed -n 's/.*--dport \([0-9]*\):\([0-9]*\).*/\2/p' "$HY_DIR/port-hop.sh" | head -n1)"
+            [[ -n "$ps" && -n "$pe" ]] && hy_hop_clean "$ps" "$pe" "$PORT"
+            rm -f "$HY_DIR/port-hop.sh"
+            if [[ "$INIT_SYS" == "systemd" ]]; then
+                systemctl disable --now "${HY_SERVICE}-hop" >/dev/null 2>&1
+                rm -f "/etc/systemd/system/${HY_SERVICE}-hop.service"; systemctl daemon-reload
+            else
+                rm -f "/etc/local.d/${HY_SERVICE}-hop.start"
+            fi
+            info "已关闭端口跳跃"
+        fi
+        return 0
+    fi
+    if ! command -v iptables >/dev/null 2>&1; then
+        warn "未安装 iptables, 端口跳跃已跳过(其余功能正常)"
+        HOP_START=""; HOP_END=""
+        return 0
+    fi
+    hy_hop_clean "$HOP_START" "$HOP_END" "$PORT"
+    if ! iptables -t nat -A PREROUTING -p udp --dport "$HOP_START":"$HOP_END" -j DNAT --to-destination ":$PORT" 2>/dev/null; then
+        warn "端口跳跃规则写入失败(nat 表不可用), 已跳过该项"
+        HOP_START=""; HOP_END=""
+        return 0
+    fi
+    ok "端口跳跃已生效: UDP ${HOP_START}-${HOP_END} → ${PORT}"
+    mkdir -p "$HY_DIR"
+    {
+        echo '#!/bin/sh'
+        printf 'iptables -t nat -D PREROUTING -p udp --dport %s:%s -j DNAT --to-destination :%s 2>/dev/null\n' "$HOP_START" "$HOP_END" "$PORT"
+        printf 'iptables -t nat -A PREROUTING -p udp --dport %s:%s -j DNAT --to-destination :%s\n' "$HOP_START" "$HOP_END" "$PORT"
+    } > "$HY_DIR/port-hop.sh"
+    chmod +x "$HY_DIR/port-hop.sh"
+    if [[ "$INIT_SYS" == "systemd" ]]; then
+        cat > "/etc/systemd/system/${HY_SERVICE}-hop.service" <<UNIT
+[Unit]
+Description=ProxyBox Hysteria2 port hopping
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${HY_DIR}/port-hop.sh
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+        systemctl daemon-reload
+        systemctl enable --now "${HY_SERVICE}-hop" >/dev/null 2>&1
+    elif [[ -d /etc/local.d ]]; then
+        cp -f "$HY_DIR/port-hop.sh" "/etc/local.d/${HY_SERVICE}-hop.start"
+        chmod +x "/etc/local.d/${HY_SERVICE}-hop.start"
+        rc-update add local default >/dev/null 2>&1
+    fi
+    return 0
+}
+
+# 应用 Hysteria2: 生成配置 → 起服务 → 存活检查 (与 Xray 分支同样的严格校验)
+hy_apply() {
+    ensure_dirs
+    if [[ ! -f "$SB_ENV_DIR/hy2.env" ]]; then err "未找到 hy2 参数文件"; return 1; fi
+    ensure_hy_core || return 1
+    hy_ensure_service
+    hy_gen_config || return 1
+    # sing-box 若还挂着旧版 hysteria2 入站, 必须先删掉并重启, 否则两个内核抢同一个 UDP 端口
+    if [[ -f "$SB_CFG_DIR/hy2.json" ]]; then
+        rm -f "$SB_CFG_DIR/hy2.json" "$SB_BAK_DIR/hy2.json.bak"
+        info "已清理 sing-box 的旧 Hysteria2 配置(避免与官方内核抢端口)"
+        svc_do_restart >/dev/null 2>&1 || true
+    fi
+    hy_hop_apply
+    if ! hysvc_restart; then
+        err "Hysteria2 服务启动失败, 最近日志:"
+        hysvc_log_tail 20 | sed 's/^/    /'
+        return 1
+    fi
+    sleep 1
+    if ! hysvc_active; then
+        err "Hysteria2 启动后立即退出, 最近日志:"
+        hysvc_log_tail 25 | sed 's/^/    /'
+        if [[ "$CERT_MODE" == "acme" ]]; then
+            warn "ACME 方式需要: 域名已解析到本机 + UDP/TCP 443 未被占用; 也可改用自签证书。"
+        fi
+        return 1
+    fi
+    verify_installed hy2
+}
+
+# 老版本( sing-box 内核 )安装的 Hysteria2 迁移到官方内核: 只动 hy2, 不碰 SS2022 / Reality
+hy_migrate_check() {
+    [[ -f "$SB_ENV_DIR/hy2.env" ]] || return 0
+    [[ -f "$HY_DIR/.migrated" ]] && return 0
+    if [[ -x "$HY_BIN" ]] && [[ -f "$HY_CFG" ]] && hysvc_active; then
+        mkdir -p "$HY_DIR"; : > "$HY_DIR/.migrated"; return 0
+    fi
+    warn "检测到 Hysteria2 还是旧版(sing-box 内核)安装的配置。"
+    info "新版改用官方 hysteria 内核(与 seagullz4/hysteria2 同方案); 只重建 Hysteria2, SS2022 / Reality 完全不受影响。"
+    ask "现在升级为官方内核? [Y/n]" "y"
+    if [[ "$RESULT" =~ ^[nN]$ ]]; then
+        info "已跳过; 之后可在『修改配置』里改任意一项时自动完成升级。"
+        return 0
+    fi
+    if hy_apply; then
+        mkdir -p "$HY_DIR"; : > "$HY_DIR/.migrated"
+        print_share hy2
+        ok "Hysteria2 已切换到官方内核"
+    else
+        err "升级失败, 原 sing-box 配置未被破坏, 可继续使用旧内核。"
+    fi
+}
 
 # Xray 配置自检(兼容新旧命令行形式); 失败时把内核真实报错打印到 stderr 便于排查
 xray_test_config() {
@@ -893,6 +1197,7 @@ load_env() {
     # 以下变量将被 env 文件覆盖/补充
     PORT=""; METHOD=""; PASSWORD=""; UUID=""; NAME=""; MASQ=""
     CERT_MODE=""; CERT_FILE=""; KEY_FILE=""; DOMAIN=""; CERT_CN=""
+    HOP_START=""; HOP_END=""; ACME_EMAIL=""
     SNI_HOST=""; SNI_PORT=""; RPC=""
     REALITY_PK=""; REALITY_PUB=""; SHORT_ID=""
     # shellcheck disable=SC1090
@@ -984,7 +1289,7 @@ gen_config() {
     CUR_KEY="$k"
     # TLS 型协议使用自签模式但还没有本协议独立证书时, 先补生成(兼容旧版共享证书的安装)
     case "$k" in
-        hy2|tuic)
+        tuic)
             if [[ "$CERT_MODE" != "manual" && ( ! -f "$SB_CERT_DIR/$k.pem" || ! -f "$SB_CERT_DIR/$k.key" ) ]]; then
                 gen_self_signed_cert "$k" "${DOMAIN:-localhost}" >/dev/null || true
             fi ;;
@@ -992,9 +1297,10 @@ gen_config() {
     [[ -f "$cfg" ]] && cp -f "$cfg" "$bak"
     case "$k" in
         ss2022)   cfg_body_ss2022   > "$cfg" ;;
-        hy2)      cfg_body_hy2      > "$cfg" ;;
         tuic)     cfg_body_tuic     > "$cfg" ;;
         vless-ts) cfg_body_vless_ts > "$cfg" ;;
+        # Hysteria2 由官方 hysteria 内核接管(独立服务), sing-box 不再生成该入站
+        hy2)      rm -f "$cfg" "$bak"; rm -f "$errf"; return 0 ;;
         # Reality(vless-rv/vless-rg) 由 Xray 内核接管, 绝不能再生成 sing-box 配置,
         # 否则 sing-box 与 Xray 同时监听同一端口 → 客户端握手失败(超时)
         vless-rv|vless-rg) rm -f "$cfg" "$bak"; rm -f "$errf"; return 0 ;;
@@ -1016,20 +1322,28 @@ gen_config() {
 # 重新生成全部配置并重启
 apply_all() {
     ensure_service
-    local k rc=0 has_reality=0
+    local k rc=0 has_reality=0 has_hy2=0
     for k in $(installed_keys); do
-        # Reality 协议走 Xray 内核, 跳过 sing-box 配置生成
-        case "$k" in vless-rv|vless-rg) has_reality=1; continue ;; esac
+        # Reality 走 Xray 内核 / Hysteria2 走官方 hysteria 内核, 都不由 sing-box 承载
+        case "$k" in
+            vless-rv|vless-rg) has_reality=1; continue ;;
+            hy2)               has_hy2=1; continue ;;
+        esac
         gen_config "$k" || rc=1
     done
-    # 清掉 sing-box 目录里的 Reality 残留(老版本迁移遗留), 避免与 Xray 抢端口
-    rm -f "$SB_CFG_DIR/vless-rv.json" "$SB_CFG_DIR/vless-rg.json"
+    # 清掉 sing-box 目录里的 Reality / Hysteria2 残留(老版本迁移遗留), 避免内核之间抢端口
+    rm -f "$SB_CFG_DIR/vless-rv.json" "$SB_CFG_DIR/vless-rg.json" "$SB_CFG_DIR/hy2.json"
     (( rc == 1 )) && return 1
     svc_restart
     # 有 Reality 协议时重建并重启 Xray
     if [[ "$has_reality" == "1" ]]; then
         ensure_xray_core && xray_ensure_service && xray_rebuild_config && xsvc_restart
     fi
+    # 有 Hysteria2 时应用并重启官方内核
+    if [[ "$has_hy2" == "1" ]]; then
+        hy_apply || rc=1
+    fi
+    return $rc
 }
 
 cfg_body_ss2022() {
@@ -1056,32 +1370,6 @@ tls_fields() {
     else
         echo "\"certificate_path\": \"${SB_CERT_DIR}/${CUR_KEY}.pem\", \"key_path\": \"${SB_CERT_DIR}/${CUR_KEY}.key\""
     fi
-}
-
-cfg_body_hy2() {
-    local tls
-    tls="$(tls_fields)"
-    cat <<EOF
-{
-  "inbounds": [
-    {
-      "type": "hysteria2",
-      "tag": "in-hy2",
-      "listen": "$(listen_host)",
-      "listen_port": ${PORT},
-      "users": [
-        { "password": "${PASSWORD}" }
-      ],
-      "masquerade": "${MASQ}",
-      "tls": {
-        "enabled": true,
-        "alpn": ["h3"],
-        ${tls}
-      }
-    }
-  ]
-}
-EOF
 }
 
 cfg_body_tuic() {
@@ -1206,10 +1494,12 @@ link_ss2022() {
 }
 
 link_hy2() {
-    local q=""
-    [[ -n "$DOMAIN" && "$DOMAIN" != "localhost" ]] && q="&sni=${DOMAIN}"
-    [[ "$(insecure_hint)" == "1" ]] && q="${q}&insecure=1"
-    echo "hy2://${PASSWORD}@${IP}:${PORT}/?obfs=none${q}#${NODE_LABEL}"
+    # 官方 hysteria 服务端: insecure 仅自签需要; 端口跳跃用 mport 参数
+    local p=()
+    [[ -n "$DOMAIN" && "$DOMAIN" != "localhost" ]] && p+=("sni=${DOMAIN}")
+    [[ "$CERT_MODE" != "manual" && "$CERT_MODE" != "acme" ]] && p+=("insecure=1")
+    [[ -n "${HOP_START:-}" && -n "${HOP_END:-}" ]] && p+=("mport=${PORT},${HOP_START}-${HOP_END}")
+    echo "hy2://${PASSWORD}@${IP}:${PORT}/?$(IFS='&'; echo "${p[*]}")#${NODE_LABEL}"
 }
 
 link_tuic() {
@@ -1259,7 +1549,12 @@ print_share() {
         hy2)
             printf '  密码: %s\n' "$PASSWORD"
             printf '  SNI/伪装域名: %s\n' "$DOMAIN"
-            printf '  证书: %s\n' "$([[ "$CERT_MODE" == "manual" ]] && echo "自有/签发证书(已校验, 无需开不安全)" || echo "自签(客户端需开启『允许不安全』)")" ;;
+            case "$CERT_MODE" in
+                manual) printf '  证书: 自有/签发证书(%s, 无需开不安全)\n' "$CERT_FILE" ;;
+                acme)   printf '  证书: 内置 ACME 自动申请/续期(无需开不安全)\n' ;;
+                *)      printf '  证书: 自签(客户端需开启『允许不安全/Insecure』)\n' ;;
+            esac
+            [[ -n "${HOP_START:-}" && -n "${HOP_END:-}" ]] && printf '  端口跳跃: %s-%s (客户端链接已带 mport)\n' "$HOP_START" "$HOP_END" ;;
         tuic)
             printf '  UUID: %s\n' "$UUID"
             printf '  密码: %s\n' "$PASSWORD"
@@ -1461,58 +1756,89 @@ ENV
 
 #--------------------------------- Hysteria2 --------------------------------------
 add_hy2() {
-    pre_install "安装 Hysteria2" "Hysteria2 是基于 QUIC(UDP) 的高性能代理，弱网/高丢包环境速度优势明显。UDP 协议，端口号可与 TCP 型协议(如 VLESS-Vision 的 TCP 443)相同并存。" || return 1
-    ask_port 8443 udp
+    pre_install "安装 Hysteria2" "Hysteria2 使用官方 hysteria 内核(与 seagullz4/hysteria2 同方案), QUIC/UDP 传输, 弱网/高丢包环境速度快。UDP 与 TCP 端口互不影响, 可与 VLESS(TCP 443)同号并存。" || return 1
+    ask_port 443 udp
     title "Hysteria2 密码设置"
     local defpass
     defpass="$(gen_rand 16)"
     info "填写规则: 仅字母/数字/下划线/点/短横线（会拼进分享链接，别用特殊符号），8~32 位。回车直接用随机密码。"
     ask_valid "输入连接密码" "$defpass" v_uri_safe
     PASSWORD="$RESULT"
+
     title "TLS 证书设置"
     info "Hysteria2 走加密的 QUIC，必须有 TLS 证书。三种来源:"
-    info "① 自签证书: 不需要域名，脚本自动生成；代价是客户端节点里要打开『允许不安全/Insecure』开关。"
-    info "② 已有证书文件: 你已经用 acme.sh / certbot / 宝塔 等给域名签发过证书，直接填 pem 和 key 路径。"
-    info "③ acme.sh 自动申请: 需要你自己的域名已把 A 记录解析到本机 IP，且 80 端口空闲；签发全自动、自动续期，客户端无需开不安全。"
+    info "① 自签证书: 不需要域名，脚本自动生成；客户端节点里要打开『允许不安全/Insecure』开关。"
+    info "② 已有证书文件: 用 acme.sh / certbot / 宝塔 签好的 pem + key，直接填路径。"
+    info "③ 内置 ACME 自动申请: 填域名+邮箱，由 hysteria 自己申请并自动续期，客户端无需开不安全。"
     ask_choice "选择证书来源" 1 \
         1 "自签证书（没有域名选这个，最快最简单）" \
         2 "已有证书文件（我有签发好的 pem + key）" \
-        3 "acme.sh 自动申请（我有域名且已解析到本机）"
-    local fallback_selfsign=0
-    CERT_FILE=""; KEY_FILE=""
-    if [[ "$RESULT" == "2" ]]; then
-        ask_valid "输入证书(.pem/.crt)完整路径" "" v_path
-        CERT_FILE="$RESULT"
-        ask_valid "输入私钥(.key)完整路径" "" v_path
-        KEY_FILE="$RESULT"
-        CERT_MODE="manual"
-        ask_valid "输入证书对应的域名(用于客户端 SNI)" "" v_domain
-        DOMAIN="$RESULT"
-    elif [[ "$RESULT" == "3" ]]; then
-        ask_valid "输入你的域名(需已解析到本机 IP)" "" v_domain
-        DOMAIN="$RESULT"
-        if acme_issue_cert "hy2" "$DOMAIN"; then
-            CERT_MODE="manual"; CERT_FILE="$SB_CERT_DIR/hy2.pem"; KEY_FILE="$SB_CERT_DIR/hy2.key"; CERT_CN="$DOMAIN"
-        else
-            warn "自动签发失败，改为自签证书。"
-            fallback_selfsign=1
-        fi
-    fi
-    if [[ "$CERT_MODE" != "manual" || "$fallback_selfsign" == "1" ]]; then
+        3 "内置 ACME 自动申请（我有域名且已解析到本机）"
+    local sel="$RESULT"
+    CERT_FILE=""; KEY_FILE=""; ACME_EMAIL=""
+    case "$sel" in
+        2)
+            ask_valid "输入证书(.pem/.crt)完整路径" "" v_path
+            CERT_FILE="$RESULT"
+            ask_valid "输入私钥(.key)完整路径" "" v_path
+            KEY_FILE="$RESULT"
+            ask_valid "输入证书对应的域名(用于客户端 SNI)" "" v_domain
+            DOMAIN="$RESULT"
+            CERT_MODE="manual"; CERT_CN="$DOMAIN" ;;
+        3)
+            ask_valid "输入你的域名(需已解析到本机 IP)" "" v_domain
+            DOMAIN="$RESULT"
+            ask "输入 ACME 邮箱(用于证书到期通知, 回车用默认)" "admin@${DOMAIN#*.}"
+            ACME_EMAIL="$RESULT"
+            if [[ "$PORT" != "443" ]]; then
+                warn "内置 ACME 用 443 端口做 TLS-ALPN-01 验证, 当前 ${PORT} 会签发失败。"
+                ask "改用 UDP 443 端口? [Y/n]" "y"
+                if [[ "$RESULT" =~ ^[nN]$ ]]; then
+                    warn "保持 ${PORT}: ACME 大概率失败, 失败后可改回自签证书。"
+                elif port_in_use 443 udp; then
+                    err "UDP 443 已被占用, 无法改用; 请释放后重试, 或退回上一步选自签证书。"
+                    return 1
+                else
+                    PORT="443"
+                fi
+            fi
+            CERT_MODE="acme" ;;
+        *)
+            CERT_MODE="self" ;;
+    esac
+    if [[ "$CERT_MODE" == "self" ]]; then
         title "自签证书域名(伪装用)"
-        info "这个域名只是写进自签证书的名字（俗称『偷』一个域名填），不需要真实存在、不需要解析。"
-        info "客户端 SNI 也填它；客户端需打开『允许不安全/Insecure』开关。直接回车用默认即可。"
+        info "这个域名只是写进自签证书的名字（不需要真实存在、不需要解析），客户端 SNI 也填它。"
+        info "客户端需打开『允许不安全/Insecure』开关。直接回车用默认即可。"
         ask_valid "输入伪装域名" "bing.com" v_domain
         DOMAIN="$RESULT"
-        [[ "$CERT_CN" != "$DOMAIN" ]] && rm -f "$SB_CERT_DIR/hy2.pem" "$SB_CERT_DIR/hy2.key"
-        gen_self_signed_cert hy2 "$DOMAIN" >/dev/null || warn "自签证书生成失败，将沿用旧证书"
-        CERT_MODE="auto"; CERT_FILE=""; KEY_FILE=""; CERT_CN="$DOMAIN"
+        rm -f "$SB_CERT_DIR/hy2.pem" "$SB_CERT_DIR/hy2.key"
+        gen_self_signed_cert hy2 "$DOMAIN" >/dev/null || { err "自签证书生成失败"; return 1; }
+        CERT_CN="$DOMAIN"
     fi
+
     title "网站伪装(可选)"
-    info "没有认证的 HTTP 请求会被重定向到下面这个网站，让端口扫描行为更像正常站点。直接回车即可。"
-    ask_valid "输入伪装网址" "https://www.bing.com" v_url
+    info "未通过认证的 HTTP 请求会被反代到下面这个网站，端口扫描看起来像正常站点。直接回车即可。"
+    ask_valid "输入伪装网址" "https://news.ycombinator.com/" v_url
     MASQ="$RESULT"
-    ask_node_name "hy2-${DOMAIN}"
+
+    title "端口跳跃(可选)"
+    info "开启后客户端可在一段 UDP 端口范围内跳跃, 抗封锁更强。需要 iptables 支持, 不用就回车跳过。"
+    ask "开启端口跳跃? [y/N]" "n"
+    HOP_START=""; HOP_END=""
+    if [[ "$RESULT" =~ ^[yY] ]]; then
+        ask_valid "输入起始端口(如 20000)" "" v_port
+        HOP_START="$RESULT"
+        while :; do
+            ask_valid "输入结束端口(需大于起始端口)" "" v_port
+            HOP_END="$RESULT"
+            (( 10#$HOP_END > 10#$HOP_START )) && break
+            err "结束端口必须大于起始端口"
+        done
+        (( 10#$HOP_END - 10#$HOP_START > 2000 )) && warn "范围超过 2000 个端口, 可能被安全组/运营商丢弃, 建议 200~1000 个。"
+    fi
+
+    ask_node_name "hysteria2-${DOMAIN}"
     SAVE_NAME="$NODE_NAME"
     cat > "$SB_ENV_DIR/hy2.env" <<ENV
 PORT=$PORT
@@ -1523,16 +1849,19 @@ CERT_FILE=$CERT_FILE
 KEY_FILE=$KEY_FILE
 CERT_CN='$CERT_CN'
 MASQ='$MASQ'
+ACME_EMAIL='$ACME_EMAIL'
+HOP_START='$HOP_START'
+HOP_END='$HOP_END'
 NAME='$SAVE_NAME'
 CREATED="$(date '+%F %T')"
 ENV
     chmod 600 "$SB_ENV_DIR/hy2.env"
     apply_one "hy2" || return 1
+    [[ -n "$HOP_START" && -n "$HOP_END" ]] && info "端口跳跃范围 ${HOP_START}-${HOP_END} 若用云服务器, 请到控制台安全组一并放行 UDP。"
     print_share "hy2"
     ok "Hysteria2 安装完成"
 }
 
-#--------------------------------- TUIC -------------------------------------------
 add_tuic() {
     pre_install "安装 TUIC v5" "TUIC 是基于 QUIC(UDP) 的代理，支持 0-RTT，延迟低。与 Hysteria2 同为 UDP 协议，端口可与 TCP 型协议共用同号。" || return 1
     ask_port 9443 udp
@@ -1747,6 +2076,11 @@ apply_one() {
         err "未找到 $k 参数文件: $SB_ENV_DIR/$k.env"
         return 1
     fi
+    if [[ "$(proto_kernel "$k")" == "hysteria" ]]; then
+        # ---- Hysteria2: 官方 hysteria 内核(独立服务) ----
+        hy_apply
+        return $?
+    fi
     if [[ "$(proto_kernel "$k")" == "xray" ]]; then
         # ---- Reality 协议: Xray 内核 (v2ray-agent 同款) ----
         ensure_xray_core || return 1
@@ -1807,12 +2141,14 @@ menu_list() {
     printf '  %-10s %-28s %-8s %s\n' "协议" "说明" "端口" "转发状态"
     hr
     local proto proto_name port st
-    st="禁用"; svc_active && st="$(svc_status_text)"
     for k in "${keys[@]}"; do
         load_env "$k"
+        # 每个协议按自己所属内核判断运行状态(sing-box / Xray / hysteria 三套服务)
+        st="未运行"
+        kernel_active "$k" && st="运行中"
         case "$k" in
             ss2022)   proto_name="Shadowsocks-2022 (TCP)" ;;
-            hy2)      proto_name="Hysteria2 (UDP/QUIC)" ;;
+            hy2)      proto_name="Hysteria2 官方内核 (UDP/QUIC)" ;;
             tuic)     proto_name="TUIC v5 (UDP/QUIC)" ;;
             vless-rv) proto_name="VLESS-Reality-Vision (TCP)" ;;
             vless-rg) proto_name="VLESS-Reality-gRPC (TCP)" ;;
@@ -1825,6 +2161,9 @@ menu_list() {
     info "sing-box 状态: $(svc_active && echo 运行中 || echo 未运行)   版本: $("$SB_BIN" version 2>/dev/null | head -n1 || echo 未知)"
     if [[ -x "$XRAY_BIN" ]]; then
         info "Xray(Reality) 状态: $(xsvc_active && echo 运行中 || echo 未运行)   版本: $("$XRAY_BIN" version 2>/dev/null | head -n1 | awk '{print $2}' || echo 未知)"
+    fi
+    if [[ -x "$HY_BIN" ]]; then
+        info "Hysteria2(官方内核) 状态: $(hysvc_active && echo 运行中 || echo 未运行)   版本: $("$HY_BIN" version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || echo 未知)"
     fi
     return 0
 }
@@ -1861,7 +2200,7 @@ menu_view() {
 # env 文件重写(修改后调用), 依赖 load_env 结果；单引号会被剔除以保护 env 语法
 rewrite_env() {
     local k="$1"
-    local base="PORT UUID PASSWORD METHOD NAME DOMAIN CERT_MODE CERT_FILE KEY_FILE CERT_CN MASQ SNI_HOST SNI_PORT RPC REALITY_PUB REALITY_PK SHORT_ID"
+    local base="PORT UUID PASSWORD METHOD NAME DOMAIN CERT_MODE CERT_FILE KEY_FILE CERT_CN MASQ SNI_HOST SNI_PORT RPC REALITY_PUB REALITY_PK SHORT_ID HOP_START HOP_END ACME_EMAIL"
     local var val out=""
     {
         for var in $base; do
@@ -1959,43 +2298,64 @@ menu_edit_hy2() {
     ask_choice "Hysteria2 修改项" "" \
         1 "修改监听端口(当前: $PORT)" \
         2 "修改连接密码(当前已设置)" \
-        3 "更换证书方式(自签/已有文件/acme自动申请)" \
-        4 "修改伪装域名(当前: ${DOMAIN}; 自签模式下会同步重新生成证书)" \
-        5 "修改节点名称(当前: ${NAME})"
+        3 "更换证书方式(自签/已有文件/内置ACME)" \
+        4 "修改伪装网址(当前: ${MASQ})" \
+        5 "修改伪装域名(当前: ${DOMAIN}; 自签模式下会重新生成证书)" \
+        6 "端口跳跃开关(当前: ${HOP_START:+$HOP_START-$HOP_END}${HOP_START:-关闭})" \
+        7 "修改节点名称(当前: ${NAME})"
     [[ -z "$RESULT" ]] && return 0
     case "$RESULT" in
         1) ask_port "$PORT" udp ;;
-        2) ask_valid "输入新密码" "$(gen_rand 16)" v_uri_safe; PASSWORD="$RESULT";;
+        2) ask_valid "输入新密码" "$(gen_rand 16)" v_uri_safe; PASSWORD="$RESULT" ;;
         3)
             ask_choice "TLS 证书来源" 1 \
                 1 "自签证书(客户端需允许不安全)" \
                 2 "已有证书文件" \
-                3 "acme.sh 自动申请(需域名解析到本机, 80 端口空闲)"
-            if [[ "$RESULT" == "2" ]]; then
-                ask_valid "输入证书路径" "${CERT_FILE:-}" v_path; CERT_FILE="$RESULT"
-                ask_valid "输入私钥路径" "${KEY_FILE:-}" v_path; KEY_FILE="$RESULT"
-                CERT_MODE="manual"
-            elif [[ "$RESULT" == "3" ]]; then
-                ask_valid "输入你的域名" "${DOMAIN:-}" v_domain; DOMAIN="$RESULT"
-                if acme_issue_cert hy2 "$DOMAIN"; then
-                    CERT_MODE="manual"; CERT_FILE="$SB_CERT_DIR/hy2.pem"; KEY_FILE="$SB_CERT_DIR/hy2.key"; CERT_CN="$DOMAIN"
-                else
-                    warn "签发失败, 保持原证书方式不变。"
-                fi
-            else
-                [[ "$CERT_CN" != "$DOMAIN" ]] && rm -f "$SB_CERT_DIR/hy2.pem" "$SB_CERT_DIR/hy2.key"
-                gen_self_signed_cert hy2 "$DOMAIN" >/dev/null && CERT_CN="$DOMAIN"
-                CERT_MODE="auto"; CERT_FILE=""; KEY_FILE=""
-                warn "已重新生成自签证书, 客户端需允许不安全"
-            fi ;;
-        4)
-            ask_valid "输入伪装域名(自签模式下会同步重新生成证书)" "$DOMAIN" v_domain; DOMAIN="$RESULT"
-            if [[ "$CERT_MODE" != "manual" && "$CERT_CN" != "$DOMAIN" ]]; then
+                3 "内置 ACME 自动申请(需域名解析到本机+443端口空闲)"
+            case "$RESULT" in
+                2)
+                    ask_valid "输入证书路径" "${CERT_FILE:-}" v_path; CERT_FILE="$RESULT"
+                    ask_valid "输入私钥路径" "${KEY_FILE:-}" v_path; KEY_FILE="$RESULT"
+                    ask_valid "输入证书对应域名(客户端 SNI)" "$DOMAIN" v_domain; DOMAIN="$RESULT"
+                    CERT_MODE="manual"; CERT_CN="$DOMAIN" ;;
+                3)
+                    ask_valid "输入你的域名" "${DOMAIN:-}" v_domain; DOMAIN="$RESULT"
+                    ask "输入 ACME 邮箱" "${ACME_EMAIL:-admin@${DOMAIN#*.}}"; ACME_EMAIL="$RESULT"
+                    if [[ "$PORT" != "443" ]]; then
+                        warn "内置 ACME 用 443 端口做 TLS-ALPN-01 验证, 当前 ${PORT} 会签发失败。"
+                        ask "改用 UDP 443 端口? [Y/n]" "y"
+                        if [[ ! "$RESULT" =~ ^[nN]$ ]]; then
+                            if port_in_use 443 udp; then err "UDP 443 被占用, 保持原端口"; else PORT="443"; fi
+                        fi
+                    fi
+                    CERT_MODE="acme"; CERT_FILE=""; KEY_FILE="" ;;
+                *)
+                    ask_valid "输入伪装域名(自签证书用)" "${DOMAIN:-bing.com}" v_domain; DOMAIN="$RESULT"
+                    rm -f "$SB_CERT_DIR/hy2.pem" "$SB_CERT_DIR/hy2.key"
+                    gen_self_signed_cert hy2 "$DOMAIN" >/dev/null && CERT_CN="$DOMAIN"
+                    CERT_MODE="self"; CERT_FILE=""; KEY_FILE=""
+                    warn "已重新生成自签证书, 客户端需勾选『允许不安全』" ;;
+            esac ;;
+        4) ask_valid "输入伪装网址" "${MASQ:-https://news.ycombinator.com/}" v_url; MASQ="$RESULT" ;;
+        5)
+            ask_valid "输入伪装域名" "$DOMAIN" v_domain; DOMAIN="$RESULT"
+            if [[ "$CERT_MODE" != "manual" && "$CERT_MODE" != "acme" ]]; then
                 rm -f "$SB_CERT_DIR/hy2.pem" "$SB_CERT_DIR/hy2.key"
                 gen_self_signed_cert hy2 "$DOMAIN" >/dev/null && CERT_CN="$DOMAIN"
                 ok "自签证书已按新域名重新生成"
-            fi;;
-        5) ask "输入新名称" "${NAME:-$k}"; NAME="$RESULT";;
+            fi ;;
+        6)
+            if [[ -n "${HOP_START:-}" ]]; then
+                HOP_START=""; HOP_END=""; info "已关闭端口跳跃"
+            else
+                ask_valid "输入起始端口(如 20000)" "" v_port; HOP_START="$RESULT"
+                while :; do
+                    ask_valid "输入结束端口(需大于起始端口)" "" v_port; HOP_END="$RESULT"
+                    (( 10#$HOP_END > 10#$HOP_START )) && break
+                    err "结束端口必须大于起始端口"
+                done
+            fi ;;
+        7) ask "输入新名称" "${NAME:-$k}"; NAME="$RESULT" ;;
     esac
     rewrite_env "$k"
     apply_one "$k" && print_share "$k"
@@ -2116,6 +2476,19 @@ menu_delete() {
             err "Xray 配置重建失败, 请查看上方提示"
         fi
     fi
+    # Hysteria2 走官方内核: 清掉服务、配置与端口跳跃规则
+    if [[ "$k" == "hy2" ]]; then
+        [[ -n "${HOP_START:-}" && -n "${HOP_END:-}" ]] && hy_hop_clean "$HOP_START" "$HOP_END" "$PORT"
+        hysvc_stop_now
+        if [[ "$INIT_SYS" == "systemd" ]]; then
+            rm -f "/etc/systemd/system/${HY_SERVICE}.service" "/etc/systemd/system/${HY_SERVICE}-hop.service"
+            systemctl daemon-reload
+        else
+            rm -f "/etc/init.d/${HY_SERVICE}" "/etc/local.d/${HY_SERVICE}-hop.start"
+        fi
+        rm -rf "$HY_DIR"
+        ok "已停止并移除 Hysteria2 服务(其余协议不受影响)"
+    fi
     # 若已无任何协议, 询问是否连服务/内核一起卸载
     if [[ -z "$(installed_keys)" ]]; then
         ask_choice "已无任何代理配置, 是否继续清理?" 1 \
@@ -2140,27 +2513,50 @@ menu_service() {
         3 "重启服务" \
         4 "查看服务状态"
     case "$RESULT" in
-        1) svc_do_start && ok "已启动" ;;
-        2) svc_do_stop && ok "已停止" ;;
-        3) svc_restart; if [[ -f "$XRAY_CFG" ]]; then info "重启 Xray(Reality) 服务..."; xray_ensure_service; xsvc_restart; fi ;;
-        4) svc_show_status ;;
+        1)
+            svc_do_start && ok "sing-box 已启动"
+            [[ -f "$XRAY_CFG" ]] && { xray_ensure_service; xsvc_restart && ok "Xray 已启动"; }
+            [[ -f "$SB_ENV_DIR/hy2.env" ]] && { hy_apply && ok "Hysteria2 已启动"; } ;;
+        2)
+            svc_do_stop && ok "sing-box 已停止"
+            [[ -f "$XRAY_CFG" ]] && { xsvc_stop_now; ok "Xray 已停止"; }
+            [[ -f "$HY_CFG" ]] && { hysvc_stop_now; ok "Hysteria2 已停止"; } ;;
+        3)
+            svc_restart
+            if [[ -f "$XRAY_CFG" ]]; then info "重启 Xray(Reality) 服务..."; xray_ensure_service; xsvc_restart; fi
+            if [[ -f "$SB_ENV_DIR/hy2.env" ]]; then info "重启 Hysteria2 服务..."; hy_apply && ok "Hysteria2 已重启"; fi ;;
+        4)
+            svc_show_status
+            if [[ -f "$XRAY_CFG" ]]; then
+                info "--- Xray (Reality) ---"
+                if [[ "$INIT_SYS" == "systemd" ]]; then systemctl status "$XRAY_SERVICE" --no-pager -l 2>/dev/null | head -n 12; else rc-service "$XRAY_SERVICE" status 2>/dev/null; fi
+            fi
+            if [[ -f "$HY_CFG" ]]; then
+                info "--- Hysteria2 ---"
+                if [[ "$INIT_SYS" == "systemd" ]]; then systemctl status "$HY_SERVICE" --no-pager -l 2>/dev/null | head -n 12; else rc-service "$HY_SERVICE" status 2>/dev/null; fi
+            fi ;;
     esac
     pause
 }
 
 menu_logs() {
     title "查看日志(最近 60 行)"
-    info "--- sing-box (SS2022/Hy2/TUIC) ---"
+    info "--- sing-box (SS2022/TUIC) ---"
     svc_log_tail 40 | sed 's/^/  /'
     if [[ -x "$XRAY_BIN" ]]; then
         info "--- Xray (Reality) ---"
         xsvc_log_tail 40 | sed 's/^/  /'
         info "Xray 日志文件: $XRAY_LOG_FILE"
     fi
+    if [[ -x "$HY_BIN" ]]; then
+        info "--- Hysteria2 (官方内核) ---"
+        hysvc_log_tail 40 | sed 's/^/  /'
+        info "Hysteria2 日志文件: $HY_LOG_FILE   配置: $HY_CFG"
+    fi
     if [[ "$INIT_SYS" == "systemd" ]]; then
-        info "持续跟踪: journalctl -u $SERVICE_NAME -f ; journalctl -u $XRAY_SERVICE -f"
+        info "持续跟踪: journalctl -u $SERVICE_NAME -f ; journalctl -u $XRAY_SERVICE -f ; journalctl -u $HY_SERVICE -f"
     else
-        info "持续跟踪: tail -f $LOG_FILE ; tail -f $XRAY_LOG_FILE"
+        info "持续跟踪: tail -f $LOG_FILE ; tail -f $XRAY_LOG_FILE ; tail -f $HY_LOG_FILE"
     fi
     pause
 }
@@ -2185,7 +2581,16 @@ uninstall_core() {
     fi
     rm -f "$XRAY_BIN" "$XRAY_CFG" "$XRAY_LOG_FILE" "/run/${XRAY_SERVICE}.pid"
     rm -rf /usr/local/share/xray
-    ok "sing-box 与 Xray 内核、服务均已卸载"
+    # Hysteria2 官方内核一并卸载
+    hysvc_stop_now
+    if [[ "$INIT_SYS" == "systemd" ]]; then
+        rm -f "/etc/systemd/system/${HY_SERVICE}.service" "/etc/systemd/system/${HY_SERVICE}-hop.service"
+        systemctl daemon-reload
+    elif [[ "$INIT_SYS" == "openrc" ]]; then
+        rm -f "/etc/init.d/${HY_SERVICE}" "/etc/local.d/${HY_SERVICE}-hop.start"
+    fi
+    rm -f "$HY_BIN" "$HY_LOG_FILE" "/run/${HY_SERVICE}.pid"
+    ok "sing-box / Xray / Hysteria2 内核、服务均已卸载"
 }
 
 uninstall_all() {
@@ -2582,7 +2987,7 @@ menu_install() {
         banner
         title "安装代理"
         printf '  %s1)%s '   "$BOLD" "$NC"; mark_installed "ss2022";   echo "Shadowsocks-2022     TCP, 抗重放强化"
-        printf '  %s2)%s '   "$BOLD" "$NC"; mark_installed "hy2";      echo "Hysteria2            UDP/QUIC, 弱网提速"
+        printf '  %s2)%s '   "$BOLD" "$NC"; mark_installed "hy2";      echo "Hysteria2            UDP/QUIC, 官方内核, 弱网提速"
         printf '  %s3)%s '   "$BOLD" "$NC"; mark_installed "vless-rv"; echo "VLESS-Reality-Vision TCP, 无域名偷站伪装 ★推荐·Xray内核·抗封锁最强"
         printf '  %s4)%s '   "$BOLD" "$NC"; mark_installed "vless-rg"; echo "VLESS-Reality-gRPC   TCP, 伪装+grpc传输"
         printf '  %s5)%s '   "$BOLD" "$NC"; mark_installed "vless-ts"; echo "VLESS-Vision-TLS     TCP, 带域名+自签证书 △仅作临时备用·易被探测封锁"
@@ -2626,6 +3031,7 @@ menu_install() {
 }
 
 menu_manage() {
+    hy_migrate_check
     while :; do
         banner
         title "代理管理"
@@ -2638,7 +3044,8 @@ menu_manage() {
         echo "  ${BOLD}5)${NC} 启动/停止/重启/状态"
         echo "  ${BOLD}6)${NC} 查看运行日志"
         echo "  ${BOLD}7)${NC} 更新 sing-box 内核"
-        echo "  ${BOLD}8)${NC} 彻底卸载(内核+全部配置)"
+        echo "  ${BOLD}8)${NC} 更新 Hysteria2 内核(官方)"
+        echo "  ${BOLD}9)${NC} 彻底卸载(内核+全部配置)"
         echo "  ${BOLD}0)${NC} 返回上级"
         hr
         info "已安装 ${n} 个协议"
@@ -2651,7 +3058,8 @@ menu_manage() {
             5) menu_service ;;
             6) menu_logs ;;
             7) update_core; pause ;;
-            8)
+            8) update_hy_core; pause ;;
+            9)
                 if uninstall_all; then :; fi
                 pause ;;
             0|*) return 0 ;;
