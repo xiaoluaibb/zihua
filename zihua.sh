@@ -1023,7 +1023,12 @@ hy_apply() {
     if [[ -f "$SB_CFG_DIR/hy2.json" ]]; then
         rm -f "$SB_CFG_DIR/hy2.json" "$SB_BAK_DIR/hy2.json.bak"
         info "已清理 sing-box 的旧 Hysteria2 配置(避免与官方内核抢端口)"
-        svc_do_restart >/dev/null 2>&1 || true
+        # 只剩 hy2 时 sing-box 目录已空, 此时不应再启动 sing-box(空配置会启动失败)
+        if compgen -G "$SB_CFG_DIR/*.json" >/dev/null; then
+            svc_do_restart >/dev/null 2>&1 || true
+        else
+            svc_do_stop >/dev/null 2>&1 || true
+        fi
     fi
     hy_hop_apply
     if ! hysvc_restart; then
@@ -1334,7 +1339,13 @@ apply_all() {
     # 清掉 sing-box 目录里的 Reality / Hysteria2 残留(老版本迁移遗留), 避免内核之间抢端口
     rm -f "$SB_CFG_DIR/vless-rv.json" "$SB_CFG_DIR/vless-rg.json" "$SB_CFG_DIR/hy2.json"
     (( rc == 1 )) && return 1
-    svc_restart
+    # 没有 sing-box 承载的协议时(只装了 Hysteria2 / Reality), 空配置会启动失败, 直接跳过
+    if compgen -G "$SB_CFG_DIR/*.json" >/dev/null; then
+        svc_restart
+    else
+        svc_do_stop >/dev/null 2>&1 || true
+        info "sing-box 当前无承载协议, 已跳过 sing-box 启动"
+    fi
     # 有 Reality 协议时重建并重启 Xray
     if [[ "$has_reality" == "1" ]]; then
         ensure_xray_core && xray_ensure_service && xray_rebuild_config && xsvc_restart
