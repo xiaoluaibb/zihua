@@ -78,7 +78,8 @@ Hysteria2 部分**直接调用第三方脚本** [seagullz4/hysteria2](https://gi
 
 | 项目 | 说明 |
 |------|------|
-| 安装 | 菜单选 Hysteria2 → 自动下载它的 install.sh 到 `/usr/local/bin/hy2-install.sh` 并执行，选 1 安装；四个下载通道（jsdelivr / raw / ghfast / gh-proxy）任一可用即可 |
+| 安装 | 菜单选 Hysteria2 后先选安装方式：`1` 调用第三方脚本（默认，自动下载其 install.sh 到 `/usr/local/bin/hy2-install.sh` 并执行，进去选 1 安装），`2` 用本脚本内置流程（官方 hysteria 内核）。四个下载通道（jsdelivr / raw / ghfast / gh-proxy）任一可用即可 |
+| 非 systemd 系统 | Alpine / OpenRC 上第三方脚本装不了，会自动回退内置流程 |
 | 内核 | 官方 `hysteria`，由第三方脚本下载（`/root/hy3/hysteria-linux-<arch>`） |
 | 服务 | systemd `hysteria.service`（第三方脚本创建），日志 `journalctl -u hysteria` |
 | 配置 | `/root/hy3/config.yaml` |
