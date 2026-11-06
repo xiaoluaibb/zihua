@@ -12,11 +12,11 @@
 #             三个服务独立管理, 可同时运行, UDP/TCP 端口互不冲突
 #  多协议   : 各协议独立实例+独立证书, TCP/UDP 端口可复用, 可同时运行
 #  附加功能 : 一键重装系统 (调用同仓库 reinstall-vm.sh, 支持 KVM/LXC)
-#  版本     : v1.6.3  (2026-11)
+#  版本     : v1.6.4  (2026-11)
 #===============================================================================
 
 #--------------------------------- 全局变量 ------------------------------------
-PROXYBOX_VERSION="1.6.3"
+PROXYBOX_VERSION="1.6.4"
 SB_BIN="/usr/local/bin/sing-box"
 SB_DIR="/etc/sing-box"
 SB_ENV_DIR="$SB_DIR/instance.d"          # 每个协议一份参数(env)
@@ -914,7 +914,55 @@ UNIT
 
 # 第三方脚本装的是 hysteria.service, 内置流程装的是 zihua-hy2; 两者统一从这里分发
 hy2_unit() { if hy2_third_installed && [[ "$INIT_SYS" == "systemd" ]]; then printf '%s' "$HY3_SERVICE"; else printf '%s' "$HY_SERVICE"; fi; }
-hysvc_restart()  { local u; u="$(hy2_unit)"; if [[ "$INIT_SYS" == "systemd" ]]; then systemctl restart "$u"; else rc-service "$u" restart; fi; }
+# 列出占用某个 UDP 端口的进程 PID(优先 ss, 回退 lsof)
+hy_port_pids() {
+    local p="${1:-}" pids=""
+    [[ -n "$p" ]] || return 0
+    if command -v ss >/dev/null 2>&1; then
+        pids="$(ss -H -lunp 2>/dev/null | grep -E "[:.]${p}[[:space:]]" | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u | tr '\n' ' ')"
+    fi
+    if [[ -z "${pids// }" ]] && command -v lsof >/dev/null 2>&1; then
+        pids="$(lsof -nP -iUDP:"$p" -t 2>/dev/null | sort -u | tr '\n' ' ')"
+    fi
+    printf '%s' "$pids"
+}
+
+# 释放 UDP 端口: 先停服务(避免 Restart=always 反复抢端口) → TERM 占用者 → 不行再 KILL
+# 只结束真正占着这个端口的进程, 不误伤 SS2022 / Xray
+hy_free_port() {
+    local p="${1:-}" unit="${2:-}" pids i
+    [[ -n "$p" ]] || return 0
+    if [[ -n "$unit" && "$INIT_SYS" == "systemd" ]]; then
+        systemctl stop "$unit" >/dev/null 2>&1
+        sleep 1
+    fi
+    pids="$(hy_port_pids "$p")"
+    [[ -z "${pids// }" ]] && return 0
+    info "UDP ${p} 正被进程占用(pid: ${pids}), 先结束它, 否则 hysteria 绑定端口必然失败"
+    for i in $pids; do kill -TERM "$i" 2>/dev/null || true; done
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        sleep 0.5
+        pids="$(hy_port_pids "$p")"
+        [[ -z "${pids// }" ]] && { ok "UDP ${p} 已释放"; return 0; }
+    done
+    for i in $pids; do kill -9 "$i" 2>/dev/null || true; done
+    sleep 1
+    pids="$(hy_port_pids "$p")"
+    if [[ -z "${pids// }" ]]; then ok "UDP ${p} 已释放(强制结束)"; return 0; fi
+    err "UDP ${p} 仍被占用: ${pids}"
+    return 1
+}
+
+hysvc_restart()  {
+    local u; u="$(hy2_unit)"
+    if [[ "$INIT_SYS" == "systemd" ]]; then
+        # 连续失败后 systemd 会拒绝启动(start request repeated too quickly), 必须先清失败计数
+        systemctl reset-failed "$u" >/dev/null 2>&1
+        systemctl restart "$u"
+    else
+        rc-service "$u" restart
+    fi
+}
 hysvc_active()   {
     local u; u="$(hy2_unit)"
     if [[ "$INIT_SYS" == "systemd" ]]; then
@@ -1053,6 +1101,8 @@ hy_apply() {
         hy2_third_sync >/dev/null 2>&1 || true
         # 第三方脚本自己不碰防火墙, 这里补上; 漏放行就是"服务在跑但客户端超时"
         [[ -n "${PORT:-}" ]] && open_port_in_firewall "$PORT" udp
+        # 它的 nohup 进程可能还占着端口, 重启前按端口释放, 否则 systemd 这份 bind 失败秒退
+        [[ -n "${PORT:-}" ]] && hy_free_port "$PORT" "$(hy2_unit)" >/dev/null 2>&1
         if hysvc_restart; then
             sleep 1
             verify_installed hy2
@@ -2016,16 +2066,17 @@ add_hy2() {
     ( cd /root && bash "$HY3_LOCAL" ) || info "第三方脚本已退出, 继续检测安装结果..."
 
     if hy2_third_installed && hy2_third_sync; then
-        # 第三方脚本会先用 nohup 跑一个进程再建 systemd 服务, 这里统一交给 systemd 托管
+        load_env hy2
+        # 第三方脚本会先用 nohup 跑一个进程再建 systemd 服务, 两个进程抢同一个 UDP 端口;
+        # 表现为 systemd 那份报 "bind: address already in use" 秒退。这里按端口把占用者清干净再交给 systemd
         if [[ -f "/etc/systemd/system/${HY3_SERVICE}.service" ]]; then
-            pkill -f "${HY3_DIR}/hysteria" >/dev/null 2>&1
-            sleep 1
+            hy_free_port "${PORT:-443}" "$HY3_SERVICE"
             hysvc_restart >/dev/null 2>&1
             sleep 2
             if hysvc_active; then
                 ok "已交给 systemd 托管($HY3_SERVICE), 开机自启已生效"
             else
-                err "systemd 接管失败: $HY3_SERVICE 起不来(它的 nohup 进程已被停掉, 现在没有服务在跑)"
+                err "systemd 接管失败: $HY3_SERVICE 起不来"
                 info "取证如下:"
                 hy_unit_forensics
                 ask "尝试自动修复服务单元? [Y/n]" "y"
@@ -2033,7 +2084,6 @@ add_hy2() {
             fi
         fi
         # 第三方脚本不管本机防火墙, 这里补放行(漏了就是"服务在跑但客户端超时")
-        load_env hy2
         [[ -n "${PORT:-}" ]] && open_port_in_firewall "$PORT" udp
         # 标记为已迁移, 避免下次进『代理管理』又被当成旧版反复提示
         mkdir -p "$HY_DIR"; : > "$HY_DIR/.migrated"; rm -f "$HY_DIR/.migrate_skip"
@@ -3387,6 +3437,9 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 UNIT
+    local lp
+    lp="$(sed -n 's/^listen:[[:space:]]*:*\([0-9][0-9]*\).*/\1/p' "$wd/config.yaml" 2>/dev/null | head -n1)"
+    [[ -n "$lp" ]] && hy_free_port "$lp" "$unit"
     systemctl daemon-reload >/dev/null 2>&1
     systemctl reset-failed "$unit" >/dev/null 2>&1
     systemctl enable "$unit" >/dev/null 2>&1
@@ -3473,12 +3526,33 @@ hy_diagnose() {
     if [[ -n "$ll" ]]; then
         ok "UDP ${port} 正在监听"
         if ! hysvc_active; then
-            warn "端口有人在听, 但 ${unit} 不是运行状态 → 可能被别的进程占着(例如旧 sing-box 的 hy2 入站)。占用者是:"
+            local opids
+            opids="$(hy_port_pids "$port")"
+            warn "端口有人在听, 但 ${unit} 不是运行状态 → 端口被别的进程占着, systemd 会报 bind: address already in use 并秒退。"
             printf '      %s\n' "$ll"
-            printf '   查清楚: %sss -lunp | grep :%s%s\n' "$BOLD" "$port" "$NC"
+            [[ -n "${opids// }" ]] && printf '   占用进程 pid: %s\n' "$opids"
+            if [[ -n "${opids// }" ]]; then
+                ask "结束占用进程并接管为 ${unit}? [Y/n]" "y"
+                if [[ ! "$RESULT" =~ ^[nN]$ ]]; then
+                    hy_free_port "$port" "$unit" && hysvc_restart >/dev/null 2>&1
+                    sleep 2
+                    if hysvc_active; then
+                        ok "${unit} 已接管, UDP ${port} 现由它监听"
+                        ll="$(ss -H -lunp 2>/dev/null | grep -E "[:.]${port}[[:space:]]" | head -n1)"
+                    else
+                        err "接管失败, 见下面的取证"
+                        hy_unit_forensics
+                    fi
+                fi
+            fi
         fi
     else
-        err "UDP ${port} 没有监听(配置未生效或端口被别的程序占用)"
+        err "UDP ${port} 没有监听"
+        local opids2
+        opids2="$(hy_port_pids "$port")"
+        if [[ -n "${opids2// }" ]]; then
+            warn "但系统显示这个端口被 pid ${opids2} 占着 → 端口没真正释放"
+        fi
     fi
 
     info "② 地址与 NAT"
