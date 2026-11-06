@@ -12,11 +12,11 @@
 #             三个服务独立管理, 可同时运行, UDP/TCP 端口互不冲突
 #  多协议   : 各协议独立实例+独立证书, TCP/UDP 端口可复用, 可同时运行
 #  附加功能 : 一键重装系统 (调用同仓库 reinstall-vm.sh, 支持 KVM/LXC)
-#  版本     : v1.6.0  (2026-11)
+#  版本     : v1.6.1  (2026-11)
 #===============================================================================
 
 #--------------------------------- 全局变量 ------------------------------------
-PROXYBOX_VERSION="1.6.0"
+PROXYBOX_VERSION="1.6.1"
 SB_BIN="/usr/local/bin/sing-box"
 SB_DIR="/etc/sing-box"
 SB_ENV_DIR="$SB_DIR/instance.d"          # 每个协议一份参数(env)
@@ -1047,9 +1047,12 @@ UNIT
 hy_apply() {
     ensure_dirs
     if [[ ! -f "$SB_ENV_DIR/hy2.env" ]]; then err "未找到 hy2 参数文件"; return 1; fi
+    load_env hy2
     # 第三方脚本装的: 配置归它管, 这里只同步参数 + 重启它的服务, 绝不覆盖 /root/hy3/config.yaml
     if hy2_third_installed; then
         hy2_third_sync >/dev/null 2>&1 || true
+        # 第三方脚本自己不碰防火墙, 这里补上; 漏放行就是"服务在跑但客户端超时"
+        [[ -n "${PORT:-}" ]] && open_port_in_firewall "$PORT" udp
         if hysvc_restart; then
             sleep 1
             verify_installed hy2
@@ -1096,15 +1099,26 @@ hy_apply() {
 # 老版本( sing-box 内核 )安装的 Hysteria2 迁移到官方内核: 只动 hy2, 不碰 SS2022 / Reality
 hy_migrate_check() {
     [[ -f "$SB_ENV_DIR/hy2.env" ]] || return 0
-    [[ -f "$HY_DIR/.migrated" ]] && return 0
-    if [[ -x "$HY_BIN" ]] && [[ -f "$HY_CFG" ]] && hysvc_active; then
+    [[ -f "$HY_DIR/.migrated" || -f "$HY_DIR/.migrate_skip" ]] && return 0
+    # 第三方脚本(seagullz4/hysteria2)装的: 跟"旧版 sing-box 内核"毫无关系, 直接标记, 不再提示
+    if hy2_third_installed; then
         mkdir -p "$HY_DIR"; : > "$HY_DIR/.migrated"; return 0
     fi
-    warn "检测到 Hysteria2 还是旧版(sing-box 内核)安装的配置。"
+    # 已经是官方内核(内置流程装的)也直接标记
+    if [[ -x "$HY_BIN" ]] && [[ -f "$HY_CFG" ]]; then
+        mkdir -p "$HY_DIR"; : > "$HY_DIR/.migrated"; return 0
+    fi
+    # 只有确实还留着 sing-box 内核的 hy2 配置时才提示
+    if [[ ! -f "$SB_CFG_DIR/hy2.json" ]]; then
+        mkdir -p "$HY_DIR"; : > "$HY_DIR/.migrated"; return 0
+    fi
+    warn "检测到 Hysteria2 是 v1.4.x 旧版(sing-box 内核)装的。"
     info "新版改用官方 hysteria 内核(与 seagullz4/hysteria2 同方案); 只重建 Hysteria2, SS2022 / Reality 完全不受影响。"
+    info "也可以不管它, 直接『删除某个代理』删掉 hy2, 再重新安装一次。"
     ask "现在升级为官方内核? [Y/n]" "y"
     if [[ "$RESULT" =~ ^[nN]$ ]]; then
-        info "已跳过; 之后可在『修改配置』里改任意一项时自动完成升级。"
+        mkdir -p "$HY_DIR"; : > "$HY_DIR/.migrate_skip"
+        info "已跳过, 以后不再提示。"
         return 0
     fi
     if hy_apply; then
@@ -1112,7 +1126,8 @@ hy_migrate_check() {
         print_share hy2
         ok "Hysteria2 已切换到官方内核"
     else
-        err "升级失败, 原 sing-box 配置未被破坏, 可继续使用旧内核。"
+        mkdir -p "$HY_DIR"; : > "$HY_DIR/.migrate_skip"
+        err "升级失败, 原配置未被破坏。可『删除某个代理』删掉 hy2 后重新安装。"
     fi
 }
 
@@ -1923,9 +1938,12 @@ hy2_drop_builtin() {
 
 # 按第三方脚本的卸载逻辑清理: 只动 hysteria / ipppp, 不碰 SS2022 与 Reality
 hy2_third_uninstall() {
+    local force="${1:-}"
     warn "Hysteria2 由第三方脚本安装, 按它的卸载逻辑清理(只动 hysteria, 不影响 SS2022/Reality)"
-    ask "确认卸载 Hysteria2? [y/N]" "n"
-    [[ "$RESULT" =~ ^[yY]([eE][sS])?$ ]] || { info "已取消"; return 1; }
+    if [[ "$force" != "-y" ]]; then
+        ask "确认卸载 Hysteria2? [y/N]" "n"
+        [[ "$RESULT" =~ ^[yY]([eE][sS])?$ ]] || { info "已取消"; return 1; }
+    fi
     local mp hs he
     mp="$(sed -n 's/^listen:[[:space:]]*:*\([0-9][0-9]*\).*/\1/p' "$HY3_CFG" 2>/dev/null | head -n1)"
     if [[ -f "$HY3_DIR/ipppp.sh" ]]; then
@@ -1957,6 +1975,14 @@ add_hy2() {
         add_hy2_builtin
         return $?
     fi
+    # 两种方式都可用, 默认第三方; 想逐项对照排查时可用内置流程
+    ask_choice "Hysteria2 安装方式" 1 \
+        1 "调用第三方脚本 seagullz4/hysteria2（与它自己一键安装完全一致，推荐）" \
+        2 "用本脚本内置流程（官方 hysteria 内核，参数由本脚本询问）"
+    if [[ "$RESULT" == "2" ]]; then
+        add_hy2_builtin
+        return $?
+    fi
     hy2_third_credit
     warn "接下来进入第三方脚本自己的交互界面, 它依次问你: 端口(默认443) / 证书方式(1=ACME, 2=自签) / 密码 / 伪装网址 / 端口跳跃。"
     warn "进去先选 1(安装)。装完它会打印节点链接, 然后回到本脚本, 由本脚本统一展示。"
@@ -1972,10 +1998,22 @@ add_hy2() {
         return 1
     fi
 
+    # 已经装过时它的安装向导会直接拒绝(提示『Hysteria 正在运行，请先卸载再安装』), 先在外部清掉
+    if hy2_third_installed; then
+        warn "检测到已经装过一次 Hysteria2(第三方脚本), 它的向导会拒绝『正在运行，请先卸载再安装』。"
+        ask "先卸载现有 Hysteria2 再重新安装? [Y/n]" "y"
+        if [[ "$RESULT" =~ ^[nN]$ ]]; then
+            info "已取消。只想改参数的话, 请先『删除某个代理』删掉 hy2 再重装。"
+            return 1
+        fi
+        hy2_third_uninstall -y || return 1
+    fi
+
     hy2_drop_builtin
     title "进入第三方安装脚本"
     printf '   文件: %s\n   来源: %s\n\n' "$HY3_LOCAL" "$HY3_REPO"
-    ( cd /root && bash "$HY3_LOCAL" ) || warn "第三方脚本非正常返回, 可能中途被中断"
+    info "进去选 1(安装)。装完按它自己的提示回到本脚本即可。"
+    ( cd /root && bash "$HY3_LOCAL" ) || info "第三方脚本已退出, 继续检测安装结果..."
 
     if hy2_third_installed && hy2_third_sync; then
         # 第三方脚本会先用 nohup 跑一个进程再建 systemd 服务, 这里统一交给 systemd 托管
@@ -1984,6 +2022,11 @@ add_hy2() {
             sleep 1
             hysvc_restart >/dev/null 2>&1 && ok "已交给 systemd 托管并重启($HY3_SERVICE), 开机自启已生效"
         fi
+        # 第三方脚本不管本机防火墙, 这里补放行(漏了就是"服务在跑但客户端超时")
+        load_env hy2
+        [[ -n "${PORT:-}" ]] && open_port_in_firewall "$PORT" udp
+        # 标记为已迁移, 避免下次进『代理管理』又被当成旧版反复提示
+        mkdir -p "$HY_DIR"; : > "$HY_DIR/.migrated"; rm -f "$HY_DIR/.migrate_skip"
         print_share hy2
         ok "Hysteria2 已就绪(第三方脚本安装), 已接入本脚本的节点列表"
         info "之后可在『代理管理』里查看/启停/看日志; 卸载请用『删除某个代理』, 会走第三方脚本的清理逻辑。"
