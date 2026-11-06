@@ -12,11 +12,11 @@
 #             三个服务独立管理, 可同时运行, UDP/TCP 端口互不冲突
 #  多协议   : 各协议独立实例+独立证书, TCP/UDP 端口可复用, 可同时运行
 #  附加功能 : 一键重装系统 (调用同仓库 reinstall-vm.sh, 支持 KVM/LXC)
-#  版本     : v1.6.1  (2026-11)
+#  版本     : v1.6.2  (2026-11)
 #===============================================================================
 
 #--------------------------------- 全局变量 ------------------------------------
-PROXYBOX_VERSION="1.6.1"
+PROXYBOX_VERSION="1.6.2"
 SB_BIN="/usr/local/bin/sing-box"
 SB_DIR="/etc/sing-box"
 SB_ENV_DIR="$SB_DIR/instance.d"          # 每个协议一份参数(env)
@@ -3361,20 +3361,30 @@ hy_diagnose() {
     fi
     printf '\n'
 
+    local unit; unit="$(hy2_unit)"
     info "① 服务与监听"
-    if hysvc_active; then ok "zihua-hy2 运行中"; else err "zihua-hy2 未运行, 先到『启动/停止/重启/状态』里启动"; fi
+    if hysvc_active; then
+        ok "$unit 运行中"
+    else
+        err "$unit 未运行, 先到『启动/停止/重启/状态』里启动"
+    fi
     ll="$(ss -H -lunp 2>/dev/null | grep -E "[:.]${port}[[:space:]]" | head -n1)"
     if [[ -n "$ll" ]]; then
         ok "UDP ${port} 正在监听"
+        if ! hysvc_active; then
+            warn "端口有人在听, 但 ${unit} 不是运行状态 → 可能被别的进程占着(例如旧 sing-box 的 hy2 入站)。占用者是:"
+            printf '      %s\n' "$ll"
+            printf '   查清楚: %sss -lunp | grep :%s%s\n' "$BOLD" "$port" "$NC"
+        fi
     else
-        err "UDP ${port} 没有监听(端口被别的程序占用或配置未生效)"
+        err "UDP ${port} 没有监听(配置未生效或端口被别的程序占用)"
     fi
 
     info "② 地址与 NAT"
     printf '   网卡地址: %s\n' "$(ip -4 -o addr show 2>/dev/null | awk '{print $2" "$4}' | tr '\n' ';')"
     src="$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n1)"
     printf '   出口源地址: %s\n' "${src:-未知}"
-    ext="$(curl -4 -fsS --max-time 6 https://api.ipify.org 2>/dev/null || curl -4 -fsS --max-time 6 https://ifconfig.me/ip 2>/dev/null)"
+    ext="$( { curl -4 -fsS --max-time 6 https://api.ipify.org 2>/dev/null || curl -4 -fsS --max-time 6 https://ifconfig.me/ip 2>/dev/null; } | grep -oE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | head -n1)"
     [[ -n "$ext" ]] && printf '   公网出口 IP: %s\n' "$ext"
     case "$src" in
         10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|100.6[4-9].*|100.[7-9][0-9].*)
@@ -3426,16 +3436,69 @@ hy_diagnose() {
     elif [[ "${authf:-0}" -gt 0 ]]; then
         warn "连接到达但认证失败 → 客户端密码不对, 重新复制分享链接导入"
     else
-        warn "一条连接记录都没有 → UDP 包没到本机。按顺序查: ①云控制台安全组放行 UDP ${port} ②上面的防火墙 ③换 UDP 443 再试 ④若机器在 NAT 后面, 找服务商做端口映射"
+        local hs
+        hs="$(hysvc_log_tail 500 2>/dev/null | grep -icE "handshake|tls|certificate|timeout")"
+        if [[ "${hs:-0}" -gt 0 ]]; then
+            warn "没有成功连接, 但日志里有 ${hs} 条握手/TLS 报错 → 包已经到本机了, 问题在 TLS 证书或密码, 看第 ⑤ 项和下面的日志:"
+            hysvc_log_tail 500 2>/dev/null | grep -iE "handshake|tls|certificate|timeout" | tail -n 5 | sed 's/^/      /'
+        else
+            warn "一条连接记录都没有。两种可能: A) UDP 包没到本机; B) 包到了但 TLS 握手就失败(它默认不打日志)。"
+            printf '   先用第 ⑥ 项抓包区分: 双向有包 = B(查证书/时钟/客户端『允许不安全』), 一个包都没有 = A(查安全组与防火墙)\n'
+        fi
     fi
 
-    info "⑤ 抓包验证(最直接)"
+    info "⑤ 证书与时钟"
+    local certf=""
+    if hy2_third_installed; then
+        certf="$(sed -n 's/^[[:space:]]*cert:[[:space:]]*//p' "$HY3_CFG" 2>/dev/null | head -n1 | tr -d "'\"")"
+    elif [[ "${CERT_MODE:-self}" == "manual" ]]; then
+        certf="${CERT_FILE:-}"
+    else
+        certf="$SB_CERT_DIR/hy2.pem"
+    fi
+    if [[ -n "$certf" && -r "$certf" ]] && command -v openssl >/dev/null 2>&1; then
+        printf '   证书文件: %s\n' "$certf"
+        openssl x509 -in "$certf" -noout -subject -dates 2>/dev/null | sed 's/^/   /'
+        local nb na now nbs nas
+        nb="$(openssl x509 -in "$certf" -noout -startdate 2>/dev/null | sed 's/notBefore=//')"
+        na="$(openssl x509 -in "$certf" -noout -enddate 2>/dev/null | sed 's/notAfter=//')"
+        now="$(date +%s)"
+        nbs="$(date -d "$nb" +%s 2>/dev/null)"
+        nas="$(date -d "$na" +%s 2>/dev/null)"
+        if [[ -n "$nbs" && -n "$nas" ]]; then
+            if (( nbs > now )); then
+                err "证书生效时间在未来 $(( (nbs - now) / 60 )) 分钟 → 本机时钟偏快, 证书还没生效, 客户端必然握手失败。"
+                printf '   校时: %stimedatectl set-ntp true   (或)  ntpdate -u pool.ntp.org%s\n' "$BOLD" "$NC"
+            elif (( nas < now )); then
+                err "证书已过期 → 删掉 hy2 重装, 或改用 ACME 方式"
+            else
+                ok "证书在当前有效期内"
+            fi
+        fi
+    else
+        info "没找到可读的证书文件或系统没有 openssl, 跳过"
+    fi
+    # 时钟偏差: 用公共服务器的 HTTP Date 做参照, 偏差大会连带证书/ACME 一起出问题
+    local hd hs2
+    hd="$(curl -sI --max-time 6 https://www.cloudflare.com 2>/dev/null | sed -n 's/^[Dd]ate: //p' | head -n1 | tr -d '\r')"
+    if [[ -n "$hd" ]]; then
+        hs2="$(date -d "$hd" +%s 2>/dev/null)"
+        if [[ -n "$hs2" ]]; then
+            printf '   本机时间 %s   网络时间 %s   偏差 %+d 秒\n' "$(date '+%F %T')" "$(date -d "$hd" '+%F %T' 2>/dev/null)" "$(( $(date +%s) - hs2 ))"
+            if (( $(date +%s) - hs2 > 300 || hs2 - $(date +%s) > 300 )); then
+                warn "本机时钟偏差超过 5 分钟 → 自签证书会显示『未生效/已过期』, ACME 也会签发失败。先开 NTP 校时。"
+            fi
+        fi
+    fi
+
+    info "⑥ 抓包验证(最直接)"
     printf '   另开一个 SSH 窗口执行, 然后手机点一次连接:\n'
     printf '   %stcpdump -nni any udp port %s -c 5%s\n' "$BOLD" "$port" "$NC"
     if ! command -v tcpdump >/dev/null 2>&1; then
         printf '   (未装 tcpdump: Debian/Ubuntu 用 apt install -y tcpdump, CentOS 用 yum install -y tcpdump, Alpine 用 apk add tcpdump)\n'
     fi
     printf '   有包飘过 = 网络通, 问题在 TLS/密码; 一个包都没有 = 服务商安全组或运营商拦了 UDP。\n'
+    printf '   只看得到一个方向(只有 In 没有 Out) = 回程被拦, 换端口或换协议。\n'
     return 0
 }
 
