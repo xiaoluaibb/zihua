@@ -8,15 +8,15 @@
 #  快捷命令 : 首次运行后自动安装 zihua 命令, 以后直接输入 zihua 即可再次打开
 #  三内核   : sing-box (SS2022 / TUIC)
 #             Xray (VLESS-Reality-Vision / gRPC, 配置与 v2ray-agent 同款)
-#             hysteria 官方内核 (Hysteria2, 与 seagullz4/hysteria2 同方案)
+#             hysteria 官方内核 (Hysteria2, 安装直接调用 seagullz4/hysteria2 的 install.sh)
 #             三个服务独立管理, 可同时运行, UDP/TCP 端口互不冲突
 #  多协议   : 各协议独立实例+独立证书, TCP/UDP 端口可复用, 可同时运行
 #  附加功能 : 一键重装系统 (调用同仓库 reinstall-vm.sh, 支持 KVM/LXC)
-#  版本     : v1.5.1  (2026-11)
+#  版本     : v1.6.0  (2026-11)
 #===============================================================================
 
 #--------------------------------- 全局变量 ------------------------------------
-PROXYBOX_VERSION="1.5.1"
+PROXYBOX_VERSION="1.6.0"
 SB_BIN="/usr/local/bin/sing-box"
 SB_DIR="/etc/sing-box"
 SB_ENV_DIR="$SB_DIR/instance.d"          # 每个协议一份参数(env)
@@ -38,6 +38,12 @@ HY_DIR="/etc/sing-box/hysteria"
 HY_CFG="$HY_DIR/config.yaml"
 HY_SERVICE="zihua-hy2"
 HY_LOG_FILE="/var/log/zihua-hy2.log"
+# Hysteria2 安装/卸载交给第三方脚本完成, 出处: https://github.com/seagullz4/hysteria2 (作者 seagullz4, 感谢)
+HY3_DIR="/root/hy3"
+HY3_CFG="$HY3_DIR/config.yaml"
+HY3_SERVICE="hysteria"
+HY3_LOCAL="/usr/local/bin/hy2-install.sh"
+HY3_REPO="https://github.com/seagullz4/hysteria2"
 UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 SYSCTL_FILE="/etc/sysctl.d/99-proxybox-optimize.conf"
 SYSCTL_BAK="/etc/sysctl.d/proxybox-optimize.orig"   # 调优前原值备份(无 .conf 后缀, 不会被 sysctl 加载)
@@ -839,6 +845,14 @@ ensure_hy_core() {
 
 update_hy_core() {
     title "更新 Hysteria2 内核"
+    if hy2_third_installed; then
+        warn "Hysteria2 由第三方脚本管理, 内核更新用它菜单里的 5(在线更新hy2内核)"
+        ask "现在运行第三方脚本? [Y/n]" "y"
+        [[ "$RESULT" =~ ^[nN]$ ]] && return 0
+        [[ -f "$HY3_LOCAL" ]] || hy2_third_fetch || { err "下载失败, 可手动执行: bash <(curl -fsSL $HY3_REPO/raw/main/install.sh)"; return 1; }
+        ( cd /root && bash "$HY3_LOCAL" )
+        return 0
+    fi
     if [[ ! -x "$HY_BIN" ]]; then info "尚未安装 Hysteria2 内核, 无需更新"; return 0; fi
     local old new
     old="$("$HY_BIN" version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
@@ -898,11 +912,28 @@ UNIT
     ok "已创建并启用 Hysteria2 服务: $HY_SERVICE"
 }
 
-hysvc_restart()  { if [[ "$INIT_SYS" == "systemd" ]]; then systemctl restart "$HY_SERVICE"; else rc-service "$HY_SERVICE" restart; fi; }
-hysvc_active()   { if [[ "$INIT_SYS" == "systemd" ]]; then systemctl is-active --quiet "$HY_SERVICE" 2>/dev/null; else rc-service "$HY_SERVICE" status >/dev/null 2>&1; fi; }
-hysvc_stop_now() { if [[ "$INIT_SYS" == "systemd" ]]; then systemctl disable --now "$HY_SERVICE" >/dev/null 2>&1; else rc-service "$HY_SERVICE" stop >/dev/null 2>&1; rc-update del "$HY_SERVICE" default >/dev/null 2>&1; fi; }
-hysvc_log_tail() { if [[ "$INIT_SYS" == "systemd" ]]; then journalctl -u "$HY_SERVICE" -n "${1:-60}" --no-pager -e 2>/dev/null; else tail -n "${1:-60}" "$HY_LOG_FILE" 2>/dev/null; fi; }
-hysvc_own_pids() { pgrep -f "hysteria server -c ${HY_CFG}" 2>/dev/null | tr '\n' ' '; }
+# 第三方脚本装的是 hysteria.service, 内置流程装的是 zihua-hy2; 两者统一从这里分发
+hy2_unit() { if hy2_third_installed && [[ "$INIT_SYS" == "systemd" ]]; then printf '%s' "$HY3_SERVICE"; else printf '%s' "$HY_SERVICE"; fi; }
+hysvc_restart()  { local u; u="$(hy2_unit)"; if [[ "$INIT_SYS" == "systemd" ]]; then systemctl restart "$u"; else rc-service "$u" restart; fi; }
+hysvc_active()   {
+    local u; u="$(hy2_unit)"
+    if [[ "$INIT_SYS" == "systemd" ]]; then
+        systemctl is-active --quiet "$u" 2>/dev/null && return 0
+        # 第三方脚本会先用 nohup 起进程再建服务, 服务没接管时兜底看进程
+        [[ "$u" == "$HY3_SERVICE" ]] && pgrep -f "${HY3_DIR}/hysteria" >/dev/null 2>&1 && return 0
+        return 1
+    fi
+    rc-service "$u" status >/dev/null 2>&1
+}
+hysvc_stop_now() { local u; u="$(hy2_unit)"; if [[ "$INIT_SYS" == "systemd" ]]; then systemctl disable --now "$u" >/dev/null 2>&1; else rc-service "$u" stop >/dev/null 2>&1; rc-update del "$u" default >/dev/null 2>&1; fi; }
+hysvc_log_tail() { local u; u="$(hy2_unit)"; if [[ "$INIT_SYS" == "systemd" ]]; then journalctl -u "$u" -n "${1:-60}" --no-pager -e 2>/dev/null; else tail -n "${1:-60}" "$HY_LOG_FILE" 2>/dev/null; fi; }
+hysvc_own_pids() {
+    if hy2_third_installed; then
+        pgrep -f "${HY3_DIR}/hysteria" 2>/dev/null | tr '\n' ' '
+    else
+        pgrep -f "hysteria server -c ${HY_CFG}" 2>/dev/null | tr '\n' ' '
+    fi
+}
 
 # 生成 config.yaml (字段与官方文档一致: listen / tls 或 acme / auth / masquerade / bandwidth)
 hy_gen_config() {
@@ -1016,6 +1047,18 @@ UNIT
 hy_apply() {
     ensure_dirs
     if [[ ! -f "$SB_ENV_DIR/hy2.env" ]]; then err "未找到 hy2 参数文件"; return 1; fi
+    # 第三方脚本装的: 配置归它管, 这里只同步参数 + 重启它的服务, 绝不覆盖 /root/hy3/config.yaml
+    if hy2_third_installed; then
+        hy2_third_sync >/dev/null 2>&1 || true
+        if hysvc_restart; then
+            sleep 1
+            verify_installed hy2
+            return $?
+        fi
+        err "重启 $HY3_SERVICE 失败, 最近日志:"
+        hysvc_log_tail 20 | sed 's/^/    /'
+        return 1
+    fi
     ensure_hy_core || return 1
     hy_ensure_service
     hy_gen_config || return 1
@@ -1768,7 +1811,181 @@ ENV
 }
 
 #--------------------------------- Hysteria2 --------------------------------------
+#-------------------- Hysteria2: 直接调用第三方脚本 seagullz4/hysteria2 ------------------
+# 出处: https://github.com/seagullz4/hysteria2  (作者 seagullz4, 非常感谢)
+# 约定: 安装/卸载逻辑一律以第三方脚本为准, 本脚本只做三件事
+#   ① 下载并调用它的 install.sh  ② 把它的 config.yaml 反解进 hy2.env 供列表/分享链接使用
+#   ③ 状态/日志/启停转发到它的 systemd 服务 hysteria.service
+
+hy2_third_installed() {
+    [[ -f "$HY3_CFG" ]] && return 0
+    if [[ "$INIT_SYS" == "systemd" ]] && systemctl list-unit-files 2>/dev/null | grep -q "^${HY3_SERVICE}\.service"; then
+        return 0
+    fi
+    return 1
+}
+
+hy2_third_credit() {
+    info "Hysteria2 部分直接调用第三方脚本完成, 出处:"
+    printf '   %s%s%s   (作者 seagullz4, 感谢)\n' "$BOLD" "$HY3_REPO" "$NC"
+    info "本脚本只负责下载与调用, 并把它的安装结果接进本脚本的节点列表/状态/删除里。"
+}
+
+_hy2_third_dl() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --connect-timeout 10 --max-time 90 "$1" -o "$2" 2>/dev/null
+    else
+        wget -q -T 30 -O "$2" "$1" 2>/dev/null
+    fi
+}
+
+hy2_third_fetch() {
+    local u tmp="${HY3_LOCAL}.new"
+    mkdir -p "$(dirname "$HY3_LOCAL")"
+    for u in \
+        "https://cdn.jsdelivr.net/gh/seagullz4/hysteria2@main/install.sh" \
+        "https://raw.githubusercontent.com/seagullz4/hysteria2/main/install.sh" \
+        "https://ghfast.top/https://raw.githubusercontent.com/seagullz4/hysteria2/main/install.sh" \
+        "https://gh-proxy.com/https://raw.githubusercontent.com/seagullz4/hysteria2/main/install.sh"; do
+        if _hy2_third_dl "$u" "$tmp" && [[ -s "$tmp" ]] && grep -q "hysteria" "$tmp"; then
+            mv -f "$tmp" "$HY3_LOCAL"
+            chmod +x "$HY3_LOCAL"
+            ok "已获取第三方安装脚本: $HY3_LOCAL"
+            return 0
+        fi
+        rm -f "$tmp"
+    done
+    return 1
+}
+
+# 把第三方 config.yaml 的关键参数反解进本脚本的 hy2.env(供列表/分享链接用)
+hy2_third_sync() {
+    [[ -f "$HY3_CFG" ]] || return 1
+    local p pw dom mode="self" masq cert hs he nm
+    p="$(sed -n 's/^listen:[[:space:]]*:*\([0-9][0-9]*\).*/\1/p' "$HY3_CFG" | head -n1)"
+    pw="$(sed -n 's/^[[:space:]]*password:[[:space:]]*//p' "$HY3_CFG" | head -n1 | tr -d "'\"")"
+    masq="$(sed -n 's/^[[:space:]]*url:[[:space:]]*//p' "$HY3_CFG" | head -n1 | tr -d "'\"")"
+    if grep -q '^acme:' "$HY3_CFG"; then
+        mode="acme"
+        dom="$(sed -n '/^acme:/,/^[a-z]/p' "$HY3_CFG" | sed -n 's/^[[:space:]]*-[[:space:]]*//p' | head -n1)"
+    else
+        cert="$(sed -n 's/^[[:space:]]*cert:[[:space:]]*//p' "$HY3_CFG" | head -n1 | tr -d "'\"")"
+        dom="$(basename "${cert:-none}")"
+        dom="${dom%.crt}"; dom="${dom%.pem}"
+        [[ -n "$cert" && "$cert" != /etc/ssl/private/* ]] && mode="manual"
+    fi
+    if [[ -z "$p" ]]; then
+        err "解析 $HY3_CFG 的监听端口失败, 无法生成分享链接"
+        return 1
+    fi
+    if [[ -f "$HY3_DIR/ipppp.sh" ]]; then
+        hs="$(sed -n 's/.*--dport \([0-9]*\):\([0-9]*\).*/\1/p' "$HY3_DIR/ipppp.sh" | head -n1)"
+        he="$(sed -n 's/.*--dport \([0-9]*\):\([0-9]*\).*/\2/p' "$HY3_DIR/ipppp.sh" | head -n1)"
+    fi
+    nm="hysteria2-${dom:-hy2}"
+    [[ -n "$hs" ]] && nm="$nm-hop"
+    mkdir -p "$SB_ENV_DIR" "$HY_DIR"
+    {
+        printf 'PORT=%s\n' "$p"
+        printf "PASSWORD='%s'\n" "$pw"
+        printf "DOMAIN='%s'\n" "$dom"
+        printf 'CERT_MODE=%s\n' "$mode"
+        printf "CERT_FILE=''\nKEY_FILE=''\n"
+        printf "CERT_CN='%s'\n" "$dom"
+        printf "MASQ='%s'\n" "$masq"
+        printf "ACME_EMAIL=''\n"
+        printf "HOP_START='%s'\n" "$hs"
+        printf "HOP_END='%s'\n" "$he"
+        printf "NAME='%s'\n" "$nm"
+        printf 'CREATED="%s"\n' "$(date '+%F %T')"
+    } > "$SB_ENV_DIR/hy2.env" 2>/dev/null || { err "写入 hy2.env 失败"; return 1; }
+    chmod 600 "$SB_ENV_DIR/hy2.env"
+    : > "$HY_DIR/.thirdparty"
+    ok "已同步第三方配置: 端口 ${p}/udp, 证书方式 ${mode}, SNI ${dom:-无}"
+    return 0
+}
+
+# 内置 zihua-hy2 若还在, 先停掉, 免得和第三方脚本抢同一个 UDP 端口
+hy2_drop_builtin() {
+    [[ -f "/etc/systemd/system/${HY_SERVICE}.service" || -f "/etc/init.d/${HY_SERVICE}" ]] || return 0
+    warn "检测到本脚本内置的 zihua-hy2 服务, 先停掉, 避免与第三方脚本抢同一个 UDP 端口"
+    if [[ "$INIT_SYS" == "systemd" ]]; then
+        systemctl disable --now "$HY_SERVICE" >/dev/null 2>&1
+        rm -f "/etc/systemd/system/${HY_SERVICE}.service" "/etc/systemd/system/${HY_SERVICE}-hop.service"
+        systemctl daemon-reload
+    else
+        rc-service "$HY_SERVICE" stop >/dev/null 2>&1
+        rc-update del "$HY_SERVICE" default >/dev/null 2>&1
+        rm -f "/etc/init.d/${HY_SERVICE}" "/etc/local.d/${HY_SERVICE}-hop.start"
+    fi
+    ok "内置 Hysteria2 服务已停用(它的配置仍保留在 $HY_DIR)"
+}
+
+# 按第三方脚本的卸载逻辑清理: 只动 hysteria / ipppp, 不碰 SS2022 与 Reality
+hy2_third_uninstall() {
+    warn "Hysteria2 由第三方脚本安装, 按它的卸载逻辑清理(只动 hysteria, 不影响 SS2022/Reality)"
+    ask "确认卸载 Hysteria2? [y/N]" "n"
+    [[ "$RESULT" =~ ^[yY]([eE][sS])?$ ]] || { info "已取消"; return 1; }
+    local mp hs he
+    mp="$(sed -n 's/^listen:[[:space:]]*:*\([0-9][0-9]*\).*/\1/p' "$HY3_CFG" 2>/dev/null | head -n1)"
+    if [[ -f "$HY3_DIR/ipppp.sh" ]]; then
+        hs="$(sed -n 's/.*--dport \([0-9]*\):\([0-9]*\).*/\1/p' "$HY3_DIR/ipppp.sh" | head -n1)"
+        he="$(sed -n 's/.*--dport \([0-9]*\):\([0-9]*\).*/\2/p' "$HY3_DIR/ipppp.sh" | head -n1)"
+        if [[ -n "$hs" && -n "$he" && -n "$mp" ]] && command -v iptables >/dev/null 2>&1; then
+            iptables -t nat -D PREROUTING -i eth0 -p udp --dport "${hs}:${he}" -j DNAT --to-destination ":$mp" >/dev/null 2>&1
+        fi
+    fi
+    if [[ "$INIT_SYS" == "systemd" ]]; then
+        systemctl disable --now "$HY3_SERVICE" >/dev/null 2>&1
+        systemctl disable --now ipppp >/dev/null 2>&1
+        rm -f "/etc/systemd/system/${HY3_SERVICE}.service" "/etc/systemd/system/ipppp.service"
+        systemctl daemon-reload
+    fi
+    rm -rf "$HY3_DIR" /usr/local/bin/hy2 "$HY3_LOCAL"
+    rm -f "$HY_DIR/.thirdparty" "$SB_ENV_DIR/hy2.env"
+    ok "Hysteria2 已卸载(SS2022 / Reality 未改动)"
+    return 0
+}
+
 add_hy2() {
+    pre_install "安装 Hysteria2(调用第三方脚本)" "Hysteria2 的安装直接交给 seagullz4/hysteria2 的 install.sh 完成, 与它自己一键安装完全一致; 本脚本只负责下载、调用并把结果接进节点列表。UDP 传输, 与 TCP 443 的 Reality 可同号并存。" || return 1
+    hy2_third_credit
+    warn "接下来进入第三方脚本自己的交互界面, 它依次问你: 端口(默认443) / 证书方式(1=ACME, 2=自签) / 密码 / 伪装网址 / 端口跳跃。"
+    warn "进去先选 1(安装)。装完它会打印节点链接, 然后回到本脚本, 由本脚本统一展示。"
+    ask "继续? [Y/n]" "y"
+    [[ "$RESULT" =~ ^[nN]$ ]] && { info "已取消"; return 1; }
+
+    if [[ ! -f "$HY3_LOCAL" ]] && ! hy2_third_fetch; then
+        err "下载第三方脚本失败(四个通道都不通)"
+        info "也可以在服务器上手动执行这一条, 效果完全一样:"
+        printf '   %sbash <(curl -fsSL %s/raw/main/install.sh)%s\n' "$BOLD" "$HY3_REPO" "$NC"
+        ask "改用本脚本内置流程安装? [y/N]" "n"
+        if [[ "$RESULT" =~ ^[yY]$ ]]; then add_hy2_builtin; return $?; fi
+        return 1
+    fi
+
+    hy2_drop_builtin
+    title "进入第三方安装脚本"
+    printf '   文件: %s\n   来源: %s\n\n' "$HY3_LOCAL" "$HY3_REPO"
+    ( cd /root && bash "$HY3_LOCAL" ) || warn "第三方脚本非正常返回, 可能中途被中断"
+
+    if hy2_third_installed && hy2_third_sync; then
+        # 第三方脚本会先用 nohup 跑一个进程再建 systemd 服务, 这里统一交给 systemd 托管
+        if [[ -f "/etc/systemd/system/${HY3_SERVICE}.service" ]]; then
+            pkill -f "${HY3_DIR}/hysteria" >/dev/null 2>&1
+            sleep 1
+            hysvc_restart >/dev/null 2>&1 && ok "已交给 systemd 托管并重启($HY3_SERVICE), 开机自启已生效"
+        fi
+        print_share hy2
+        ok "Hysteria2 已就绪(第三方脚本安装), 已接入本脚本的节点列表"
+        info "之后可在『代理管理』里查看/启停/看日志; 卸载请用『删除某个代理』, 会走第三方脚本的清理逻辑。"
+    else
+        warn "没有检测到 $HY3_CFG, 看起来没装成功"
+        printf '   重新执行: %sbash %s%s 然后选 1\n' "$BOLD" "$HY3_LOCAL" "$NC"
+    fi
+}
+
+add_hy2_builtin() {
     pre_install "安装 Hysteria2" "Hysteria2 使用官方 hysteria 内核(与 seagullz4/hysteria2 同方案), QUIC/UDP 传输, 弱网/高丢包环境速度快。UDP 与 TCP 端口互不影响, 可与 VLESS(TCP 443)同号并存。" || return 1
     ask_port 443 udp
     title "Hysteria2 密码设置"
@@ -2161,7 +2378,7 @@ menu_list() {
         kernel_active "$k" && st="运行中"
         case "$k" in
             ss2022)   proto_name="Shadowsocks-2022 (TCP)" ;;
-            hy2)      proto_name="Hysteria2 官方内核 (UDP/QUIC)" ;;
+            hy2)      proto_name="Hysteria2 (第三方脚本安装, UDP/QUIC)" ;;
             tuic)     proto_name="TUIC v5 (UDP/QUIC)" ;;
             vless-rv) proto_name="VLESS-Reality-Vision (TCP)" ;;
             vless-rg) proto_name="VLESS-Reality-gRPC (TCP)" ;;
@@ -2308,6 +2525,20 @@ menu_edit_ss2022() {
 
 menu_edit_hy2() {
     local k="$1"
+    if hy2_third_installed; then
+        warn "Hysteria2 由第三方脚本安装, 端口/证书/密码/伪装都在它的安装流程里改"
+        info "重跑一遍它的安装向导即可(它会先卸载旧配置再按新参数装), 也可选 3 查看当前配置。"
+        ask "现在运行第三方脚本? [Y/n]" "y"
+        [[ "$RESULT" =~ ^[nN]$ ]] && return 0
+        [[ -f "$HY3_LOCAL" ]] || hy2_third_fetch || {
+            err "脚本不存在且下载失败, 可手动执行: bash <(curl -fsSL $HY3_REPO/raw/main/install.sh)"
+            return 1
+        }
+        ( cd /root && bash "$HY3_LOCAL" )
+        hy2_third_sync >/dev/null 2>&1 && print_share hy2
+        pause
+        return 0
+    fi
     ask_choice "Hysteria2 修改项" "" \
         1 "修改监听端口(当前: $PORT)" \
         2 "修改连接密码(当前已设置)" \
@@ -2489,8 +2720,10 @@ menu_delete() {
             err "Xray 配置重建失败, 请查看上方提示"
         fi
     fi
-    # Hysteria2 走官方内核: 清掉服务、配置与端口跳跃规则
-    if [[ "$k" == "hy2" ]]; then
+    # Hysteria2: 第三方脚本装的就按它的逻辑卸载, 内置流程装的清我们自己的服务
+    if [[ "$k" == "hy2" ]] && hy2_third_installed; then
+        hy2_third_uninstall
+    elif [[ "$k" == "hy2" ]]; then
         [[ -n "${HOP_START:-}" && -n "${HOP_END:-}" ]] && hy_hop_clean "$HOP_START" "$HOP_END" "$PORT"
         hysvc_stop_now
         if [[ "$INIT_SYS" == "systemd" ]]; then
@@ -3018,7 +3251,7 @@ menu_install() {
         banner
         title "安装代理"
         printf '  %s1)%s '   "$BOLD" "$NC"; mark_installed "ss2022";   echo "Shadowsocks-2022     TCP, 抗重放强化"
-        printf '  %s2)%s '   "$BOLD" "$NC"; mark_installed "hy2";      echo "Hysteria2            UDP/QUIC, 官方内核, 弱网提速"
+        printf '  %s2)%s '   "$BOLD" "$NC"; mark_installed "hy2";      echo "Hysteria2            UDP/QUIC, 调用第三方脚本安装, 弱网提速"
         printf '  %s3)%s '   "$BOLD" "$NC"; mark_installed "vless-rv"; echo "VLESS-Reality-Vision TCP, 无域名偷站伪装 ★推荐·Xray内核·抗封锁最强"
         printf '  %s4)%s '   "$BOLD" "$NC"; mark_installed "vless-rg"; echo "VLESS-Reality-gRPC   TCP, 伪装+grpc传输"
         printf '  %s5)%s '   "$BOLD" "$NC"; mark_installed "vless-ts"; echo "VLESS-Vision-TLS     TCP, 带域名+自签证书 △仅作临时备用·易被探测封锁"
@@ -3071,7 +3304,11 @@ hy_diagnose() {
     fi
     load_env hy2
     local port="${PORT:-443}" ll conn authf src ext pol ndrop
-    printf '  当前配置: 端口 %s/udp   证书方式 %s   SNI %s\n\n' "$port" "${CERT_MODE:-self}" "${DOMAIN:-}"
+    printf '  当前配置: 端口 %s/udp   证书方式 %s   SNI %s\n' "$port" "${CERT_MODE:-self}" "${DOMAIN:-}"
+    if hy2_third_installed; then
+        printf '  安装方式: 第三方脚本(seagullz4/hysteria2)   配置: %s\n' "$HY3_CFG"
+    fi
+    printf '\n'
 
     info "① 服务与监听"
     if hysvc_active; then ok "zihua-hy2 运行中"; else err "zihua-hy2 未运行, 先到『启动/停止/重启/状态』里启动"; fi
