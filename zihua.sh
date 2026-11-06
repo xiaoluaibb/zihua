@@ -12,11 +12,11 @@
 #             三个服务独立管理, 可同时运行, UDP/TCP 端口互不冲突
 #  多协议   : 各协议独立实例+独立证书, TCP/UDP 端口可复用, 可同时运行
 #  附加功能 : 一键重装系统 (调用同仓库 reinstall-vm.sh, 支持 KVM/LXC)
-#  版本     : v1.5.0  (2026-11)
+#  版本     : v1.5.1  (2026-11)
 #===============================================================================
 
 #--------------------------------- 全局变量 ------------------------------------
-PROXYBOX_VERSION="1.5.0"
+PROXYBOX_VERSION="1.5.1"
 SB_BIN="/usr/local/bin/sing-box"
 SB_DIR="/etc/sing-box"
 SB_ENV_DIR="$SB_DIR/instance.d"          # 每个协议一份参数(env)
@@ -1019,6 +1019,8 @@ hy_apply() {
     ensure_hy_core || return 1
     hy_ensure_service
     hy_gen_config || return 1
+    # Hysteria2 走 UDP, 必须放行; 漏这一步是"服务起来了但客户端超时"的常见原因
+    open_port_in_firewall "$PORT" udp
     # sing-box 若还挂着旧版 hysteria2 入站, 必须先删掉并重启, 否则两个内核抢同一个 UDP 端口
     if [[ -f "$SB_CFG_DIR/hy2.json" ]]; then
         rm -f "$SB_CFG_DIR/hy2.json" "$SB_BAK_DIR/hy2.json.bak"
@@ -2632,6 +2634,24 @@ open_port_in_firewall() {
         firewall-cmd --permanent --add-port="${p}"/${proto} >/dev/null 2>&1
         firewall-cmd --reload >/dev/null 2>&1 && ok "firewalld 已放行 ${p}/${proto}" && return 0
     fi
+    # 裸 iptables: 只有 INPUT 存在拦截策略时才插放行规则, 全放行的机器不去污染规则表
+    if command -v iptables >/dev/null 2>&1; then
+        local pol ndrop
+        pol="$(iptables -S INPUT 2>/dev/null | sed -n 's/^-P INPUT //p' | head -n1)"
+        ndrop="$(iptables -S INPUT 2>/dev/null | grep -cE '^-A INPUT .*-j (DROP|REJECT)')"
+        if [[ "$pol" != "ACCEPT" || "${ndrop:-0}" != "0" ]]; then
+            if iptables -C INPUT -p "$proto" --dport "$p" -j ACCEPT >/dev/null 2>&1; then
+                ok "iptables 已有 ${p}/${proto} 放行规则"
+            elif iptables -I INPUT -p "$proto" --dport "$p" -j ACCEPT >/dev/null 2>&1; then
+                ok "iptables 已放行 ${p}/${proto}"
+                # netfilter-persistent 的保存目录存在时顺手持久化, 避免重启失效
+                [[ -d /etc/iptables ]] && iptables-save > /etc/iptables/rules.v4 2>/dev/null
+            else
+                warn "iptables 放行 ${p}/${proto} 失败, 请手动处理"
+            fi
+            return 0
+        fi
+    fi
     info "提示: 如使用云服务器(AWS/GCP/阿里云等), 请到控制台『安全组/防火墙』手动放行 ${p}/${proto}。"
 }
 
@@ -3041,6 +3061,96 @@ menu_install() {
     done
 }
 
+#----------------------------- Hysteria2 连通性自检 --------------------------------
+# 客户端超时但服务端日志毫无反应时, 用它判断卡在 进程/监听/NAT/防火墙/安全组 哪一段
+hy_diagnose() {
+    title "Hysteria2 连通性自检"
+    if [[ ! -f "$SB_ENV_DIR/hy2.env" ]]; then
+        err "本机没有安装 Hysteria2"
+        return 1
+    fi
+    load_env hy2
+    local port="${PORT:-443}" ll conn authf src ext pol ndrop
+    printf '  当前配置: 端口 %s/udp   证书方式 %s   SNI %s\n\n' "$port" "${CERT_MODE:-self}" "${DOMAIN:-}"
+
+    info "① 服务与监听"
+    if hysvc_active; then ok "zihua-hy2 运行中"; else err "zihua-hy2 未运行, 先到『启动/停止/重启/状态』里启动"; fi
+    ll="$(ss -H -lunp 2>/dev/null | grep -E "[:.]${port}[[:space:]]" | head -n1)"
+    if [[ -n "$ll" ]]; then
+        ok "UDP ${port} 正在监听"
+    else
+        err "UDP ${port} 没有监听(端口被别的程序占用或配置未生效)"
+    fi
+
+    info "② 地址与 NAT"
+    printf '   网卡地址: %s\n' "$(ip -4 -o addr show 2>/dev/null | awk '{print $2" "$4}' | tr '\n' ';')"
+    src="$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n1)"
+    printf '   出口源地址: %s\n' "${src:-未知}"
+    ext="$(curl -4 -fsS --max-time 6 https://api.ipify.org 2>/dev/null || curl -4 -fsS --max-time 6 https://ifconfig.me/ip 2>/dev/null)"
+    [[ -n "$ext" ]] && printf '   公网出口 IP: %s\n' "$ext"
+    case "$src" in
+        10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|100.6[4-9].*|100.[7-9][0-9].*)
+            warn "本机出口是内网地址 → 这是 NAT/容器机器, 公网端口映射由服务商负责, 没映射就一定连不上。" ;;
+    esac
+    if [[ -n "$ext" && -n "$src" && "$ext" != "$src" ]]; then
+        warn "公网 IP(${ext}) 与网卡地址(${src}) 不一致 → 本机在 NAT 后面, 需服务商做 UDP ${port} 端口映射。"
+    fi
+
+    info "③ 防火墙"
+    if command -v ufw >/dev/null 2>&1; then
+        if ufw status 2>/dev/null | grep -q "Status: active"; then
+            if ufw status 2>/dev/null | grep -qE "${port}(/udp)?([[:space:]]|$)"; then
+                ok "ufw 已放行 UDP ${port}"
+            else
+                err "ufw 已启用, 但没有 UDP ${port} 的放行规则 → 执行: ufw allow ${port}/udp"
+            fi
+        else
+            info "ufw: 未启用(不拦截)"
+        fi
+    else
+        info "ufw: 未安装"
+    fi
+    if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+        if firewall-cmd --query-port="${port}/udp" >/dev/null 2>&1; then
+            ok "firewalld 已放行 UDP ${port}"
+        else
+            err "firewalld 已启用, 但没有 UDP ${port} → 执行: firewall-cmd --permanent --add-port=${port}/udp && firewall-cmd --reload"
+        fi
+    fi
+    if command -v iptables >/dev/null 2>&1; then
+        pol="$(iptables -S INPUT 2>/dev/null | sed -n 's/^-P INPUT //p' | head -n1)"
+        ndrop="$(iptables -S INPUT 2>/dev/null | grep -cE '^-A INPUT .*-j (DROP|REJECT)')"
+        if [[ "$pol" == "ACCEPT" && "${ndrop:-0}" == "0" ]]; then
+            info "iptables: INPUT 默认放行且无 DROP 规则(不会拦 UDP ${port})"
+        elif iptables -S INPUT 2>/dev/null | grep -q -- "--dport ${port}"; then
+            ok "iptables: 已有 UDP ${port} 相关规则"
+        else
+            warn "iptables: INPUT 策略=${pol:-未知}, 有 ${ndrop:-0} 条 DROP/REJECT 规则, 但没看到 UDP ${port} 的放行 → 执行: iptables -I INPUT -p udp --dport ${port} -j ACCEPT"
+        fi
+    fi
+
+    info "④ 服务端是否收到过客户端数据"
+    conn="$(hysvc_log_tail 500 2>/dev/null | grep -ci "client connected")"
+    authf="$(hysvc_log_tail 500 2>/dev/null | grep -ci "authentication failed")"
+    printf '   client connected: %s 次    authentication failed: %s 次\n' "${conn:-0}" "${authf:-0}"
+    if [[ "${conn:-0}" -gt 0 ]]; then
+        ok "已经成功认证过客户端 → 服务端没问题, 排查客户端(是否开『允许不安全』、密码/SNI 是否与链接一致)"
+    elif [[ "${authf:-0}" -gt 0 ]]; then
+        warn "连接到达但认证失败 → 客户端密码不对, 重新复制分享链接导入"
+    else
+        warn "一条连接记录都没有 → UDP 包没到本机。按顺序查: ①云控制台安全组放行 UDP ${port} ②上面的防火墙 ③换 UDP 443 再试 ④若机器在 NAT 后面, 找服务商做端口映射"
+    fi
+
+    info "⑤ 抓包验证(最直接)"
+    printf '   另开一个 SSH 窗口执行, 然后手机点一次连接:\n'
+    printf '   %stcpdump -nni any udp port %s -c 5%s\n' "$BOLD" "$port" "$NC"
+    if ! command -v tcpdump >/dev/null 2>&1; then
+        printf '   (未装 tcpdump: Debian/Ubuntu 用 apt install -y tcpdump, CentOS 用 yum install -y tcpdump, Alpine 用 apk add tcpdump)\n'
+    fi
+    printf '   有包飘过 = 网络通, 问题在 TLS/密码; 一个包都没有 = 服务商安全组或运营商拦了 UDP。\n'
+    return 0
+}
+
 menu_manage() {
     hy_migrate_check
     while :; do
@@ -3056,7 +3166,8 @@ menu_manage() {
         echo "  ${BOLD}6)${NC} 查看运行日志"
         echo "  ${BOLD}7)${NC} 更新 sing-box 内核"
         echo "  ${BOLD}8)${NC} 更新 Hysteria2 内核(官方)"
-        echo "  ${BOLD}9)${NC} 彻底卸载(内核+全部配置)"
+        echo "  ${BOLD}9)${NC} Hysteria2 连通性自检(连不上时先跑这个)"
+        echo "  ${BOLD}10)${NC} 彻底卸载(内核+全部配置)"
         echo "  ${BOLD}0)${NC} 返回上级"
         hr
         info "已安装 ${n} 个协议"
@@ -3070,7 +3181,8 @@ menu_manage() {
             6) menu_logs ;;
             7) update_core; pause ;;
             8) update_hy_core; pause ;;
-            9)
+            9) hy_diagnose; pause ;;
+            10)
                 if uninstall_all; then :; fi
                 pause ;;
             0|*) return 0 ;;
