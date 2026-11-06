@@ -1949,6 +1949,14 @@ hy2_third_uninstall() {
 
 add_hy2() {
     pre_install "安装 Hysteria2(调用第三方脚本)" "Hysteria2 的安装直接交给 seagullz4/hysteria2 的 install.sh 完成, 与它自己一键安装完全一致; 本脚本只负责下载、调用并把结果接进节点列表。UDP 传输, 与 TCP 443 的 Reality 可同号并存。" || return 1
+    # 第三方脚本只认 systemd 系统(Debian/Ubuntu/CentOS), Alpine/OpenRC 上直接调用必然装不上
+    if [[ "$INIT_SYS" != "systemd" ]]; then
+        warn "第三方脚本只支持 systemd 系统(Debian/Ubuntu/CentOS), 当前是 ${INIT_SYS:-未知}(如 Alpine), 直接调用装不上。"
+        ask "改用本脚本内置流程安装 Hysteria2? [Y/n]" "y"
+        [[ "$RESULT" =~ ^[nN]$ ]] && return 1
+        add_hy2_builtin
+        return $?
+    fi
     hy2_third_credit
     warn "接下来进入第三方脚本自己的交互界面, 它依次问你: 端口(默认443) / 证书方式(1=ACME, 2=自签) / 密码 / 伪装网址 / 端口跳跃。"
     warn "进去先选 1(安装)。装完它会打印节点链接, 然后回到本脚本, 由本脚本统一展示。"
